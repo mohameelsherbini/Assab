@@ -635,3 +635,62 @@ Source: local branch `task/pkg1-brc01-brc04-local` from baseline `41f03a3`. Busi
 | 19 | Replacement for the employee's accept/object: `POST /api/v1/shift-reports/{shift}/liability/respond` (unchanged endpoint, TD-7) | Headers: `Authorization`, **`Idempotency-Key` (required)**. Body: `{version:int>=1, response:'accepted'|'objected', reason?:string<=1000 (required when objected)}`. 200: `{success:true, message, data:{cashier_shift_id, version, response}}`. Errors: 422 `VALIDATION_ERROR`; 403 `ONLY_ASSIGNED_EMPLOYEE`/`UNAUTHORIZED_ACTOR`; 409 `EMPLOYEE_RESPONSE_ALREADY_RECORDED` and the stale-version codes. Records the response only; no ledger effect (the liability posts when the manager approves). | See `pkg1-brc04b-flutter-compatibility.md`. |
 
 Unchanged client contracts: error envelope `{success,message,errors}` for Custody; `error.code` envelope for Admin; no key renamed or removed.
+
+## PKG-7 / BRC-11 — Did Not Work (local candidate, not accepted)
+
+Business authority: v3.3 OPS-04/05/09, AC-26, AUD-01–04. Baseline `341a2d19fb017e9ff4b373f2930f0e3ac0b9132d`.
+
+`POST /api/v1/branch-manager/shifts/{shift}/mark-not-worked`, where `shift` is a
+CashierShift UUID (not the schedule template). Required `Idempotency-Key` and
+body `{"reason":"..."}`; trimmed nonempty reason, at most 500 characters.
+Only the active assigned branch manager may execute it. A genuinely untouched
+`not_started` assignment transitions to existing `canceled`, with one explicit
+`marked_not_worked` audit record: reason, authenticated actor and timestamp.
+Ordinary cancellation retains its meaning; do not interpret every `canceled`
+row as no-work. Partial operation must use actual sales and physical count.
+
+Success data: `id`, `status: canceled`, `status_label: لم تعمل`, `not_worked`
+(object with outcome, reason, recorded_by, recorded_by_type, recorded_at).
+Existing shift resources add nullable `not_worked`; detail exposes
+`available_actions.can_mark_not_worked`. Existing raw statuses remain intact.
+
+401 unauthenticated; 403 wrong/inactive/suspended actor; 404 unavailable scoped
+UUID; 422 invalid reason/key; 409 state, assignment, evidence, replay-payload or
+submitted-day conflict. A same-key replay returns the original snapshot;
+a different key cannot create another audit fact. Existing middleware controls
+idempotency storage and scope; no new auth or replay mechanism is introduced.
+
+No monetary fields, prior balances, actual work timestamps, financial reports,
+receipts or liability records are created/changed. Lifecycle save bypasses the
+aggregation observer; history and timestamp are explicit and transactional.
+Daily scope excludes only marked rows with validated empty evidence; conflicts
+throw `SHIFT_NOT_WORKED_EVIDENCE_CONFLICT`. Existing carryover processing remains.
+No schema migration. Local SQLite evidence is not MariaDB/RG-01 evidence.
+
+### F07-01 bounded provenance correction (local follow-up)
+
+Reassignment fields or history are not blanket proof of work. The existing
+administrative path is `not_started -> reassigned -> accepted_without_handover
+-> not_started`. It preserves original_cashier_id/reassigned_by/reassigned_at/
+reassignment_reason and `reassigned` history. This never-worked replacement
+remains eligible when its complete administrative trail, final cashier,
+assignment actor/reason and explicit acceptance identity agree, and all other
+operational/financial evidence checks pass. Multiple administrative hops are
+supported. Missing/orphaned/malformed/mismatching provenance throws
+`SHIFT_NOT_WORKED_REASSIGNMENT_AMBIGUOUS` without changing history or money.
+Started history, report separation and handover/financial evidence still reject.
+
+Legacy `recordHistory()` mislabels a morph-mapped cashier as `system`; this
+follow-up does not alter that shared writer. For the exact acceptance-without-
+handover action only, its nonzero performed_by must equal both the assigned
+cashier and accepted_by_cashier_id. The legacy label is never treated as a
+permission grant. DB-generated history timestamps are not equated with
+application-generated reassigned_at (different clocks/timezones).
+
+**Future-dated assignments:** current command has no date/time cutoff. A future
+untouched assignment meeting the same manager/evidence conditions can be marked;
+this is documented and HTTP-tested as existing behavior, not a new business
+approval for prospective cancellation. OPS-04 does not define a future-schedule
+cutoff. Whether to prohibit future marks or introduce separate prospective
+cancellation requires Mohamed/Mahmoud's explicit policy decision before changing
+behavior. This follow-up adds no cutoff and no new operation.

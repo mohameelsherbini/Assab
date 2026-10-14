@@ -58,6 +58,7 @@ class ShiftReportMutationGuard
             throw new ConflictHttpException('REPORT_SOURCE_CHANGED');
         }
         $this->assertActor($shift, $actor, $shift->shift()->value('branch_id'));
+        app(ShiftNotWorkedGuard::class)->assertMutable($shift);
         $requests = DB::table('cashier_shift_handovers')->where('cashier_shift_id', $shift->id)
             ->orderBy('id')->lockForUpdate()->get(['id', 'daily_closed_at']);
         $locks = DB::table('shift_liability_daily_locks')->where(function ($query) use ($shift, $days) {
@@ -123,6 +124,7 @@ class ShiftReportMutationGuard
         }
         app(ShiftReportCorrectionActorPolicy::class)->assertAllowed($shift, $actor);
 
+        app(ShiftNotWorkedGuard::class)->assertMutable($shift);
         $requests = DB::table('cashier_shift_handovers')->where('cashier_shift_id', $shift->id)
             ->orderBy('id')->lockForUpdate()->get(['id', 'daily_closed_at']);
         $locks = DB::table('shift_liability_daily_locks')->where(function ($query) use ($shift, $days) {
