@@ -64,6 +64,7 @@ jobs:
           changed="$(git diff --name-only "$BASE_SHA" HEAD)"
           expected="$(printf '%s\n' '.github/workflows/assab-backend-ci.yml' 'tests/Feature/AdminFamilyConcurrentEvidenceTest.php')"
           test "$changed" = "$expected"
+          mkdir -p artifacts
           printf "Source SHA: %s\nSource Tree: %s\nCI SHA: %s\nCI Tree: %s\nWorkflow Blob SHA: %s\n" "$BASE_SHA" "$SOURCE_TREE_SHA" "$(git rev-parse HEAD)" "$(git rev-parse HEAD^{tree})" "$(git rev-parse HEAD:.github/workflows/assab-backend-ci.yml)" | tee artifacts/integration-identity.txt
           mkdir -p artifacts
           printf 'Acceptance base: %s\nCI commit: %s\nChanged files:\n%s\n' "$BASE_SHA" "$(git rev-parse HEAD)" "$changed" | tee artifacts/acceptance-base.txt
@@ -164,6 +165,7 @@ jobs:
           changed="$(git diff --name-only "$BASE_SHA" HEAD)"
           expected="$(printf '%s\n' '.github/workflows/assab-backend-ci.yml' 'tests/Feature/AdminFamilyConcurrentEvidenceTest.php')"
           test "$changed" = "$expected"
+          mkdir -p artifacts
           printf "Source SHA: %s\nSource Tree: %s\nCI SHA: %s\nCI Tree: %s\nWorkflow Blob SHA: %s\n" "$BASE_SHA" "$SOURCE_TREE_SHA" "$(git rev-parse HEAD)" "$(git rev-parse HEAD^{tree})" "$(git rev-parse HEAD:.github/workflows/assab-backend-ci.yml)" | tee artifacts/integration-identity.txt
           mkdir -p artifacts
           printf 'Acceptance base: %s\nCI commit: %s\nChanged files:\n%s\n' "$BASE_SHA" "$(git rev-parse HEAD)" "$changed" | tee artifacts/acceptance-base.txt
