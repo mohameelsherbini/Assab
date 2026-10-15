@@ -2,11 +2,11 @@ name: Assab Backend CI Trial
 
 on:
   push:
-    branches: [test/s1-12]
+    branches: [test/s1-12-integrated-ci]
     paths:
       - '.github/workflows/assab-backend-ci.yml'
   workflow_dispatch:
-    branches: [test/s1-12]
+    branches: [test/s1-12-integrated-ci]
 
 permissions:
   contents: read
@@ -16,7 +16,8 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  BASE_SHA: 44346bade4ebad8a3ba39b153e0f8b57ecf1d092
+  BASE_SHA: 57bd40c3d55393db2cc113328e221d5d3a85caa0
+  SOURCE_TREE_SHA: 9f00b4623d5c3a148ccc1ba8f833b782ec7b8f88
   APP_ENV: testing
   APP_DEBUG: 'false'
   APP_KEY: base64:MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=
@@ -53,13 +54,17 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Enforce pinned S1-12 base and one-file scope
+      - name: Enforce integrated source and test-only delta
         shell: bash
         run: |
           set -euo pipefail
           git merge-base --is-ancestor "$BASE_SHA" HEAD
-          changed="$(git diff --name-only "$BASE_SHA"...HEAD)"
-          test "$changed" = '.github/workflows/assab-backend-ci.yml'
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse "$BASE_SHA^{tree}")" = "$SOURCE_TREE_SHA"
+          changed="$(git diff --name-only "$BASE_SHA" HEAD)"
+          expected="$(printf '%s\n' '.github/workflows/assab-backend-ci.yml' 'tests/Feature/AdminFamilyConcurrentEvidenceTest.php')"
+          test "$changed" = "$expected"
+          printf "Source SHA: %s\nSource Tree: %s\nCI SHA: %s\nCI Tree: %s\nWorkflow Blob SHA: %s\n" "$BASE_SHA" "$SOURCE_TREE_SHA" "$(git rev-parse HEAD)" "$(git rev-parse HEAD^{tree})" "$(git rev-parse HEAD:.github/workflows/assab-backend-ci.yml)" | tee artifacts/integration-identity.txt
           mkdir -p artifacts
           printf 'Acceptance base: %s\nCI commit: %s\nChanged files:\n%s\n' "$BASE_SHA" "$(git rev-parse HEAD)" "$changed" | tee artifacts/acceptance-base.txt
 
@@ -149,13 +154,17 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Enforce pinned S1-12 base and one-file scope
+      - name: Enforce integrated source and test-only delta
         shell: bash
         run: |
           set -euo pipefail
           git merge-base --is-ancestor "$BASE_SHA" HEAD
-          changed="$(git diff --name-only "$BASE_SHA"...HEAD)"
-          test "$changed" = '.github/workflows/assab-backend-ci.yml'
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse "$BASE_SHA^{tree}")" = "$SOURCE_TREE_SHA"
+          changed="$(git diff --name-only "$BASE_SHA" HEAD)"
+          expected="$(printf '%s\n' '.github/workflows/assab-backend-ci.yml' 'tests/Feature/AdminFamilyConcurrentEvidenceTest.php')"
+          test "$changed" = "$expected"
+          printf "Source SHA: %s\nSource Tree: %s\nCI SHA: %s\nCI Tree: %s\nWorkflow Blob SHA: %s\n" "$BASE_SHA" "$SOURCE_TREE_SHA" "$(git rev-parse HEAD)" "$(git rev-parse HEAD^{tree})" "$(git rev-parse HEAD:.github/workflows/assab-backend-ci.yml)" | tee artifacts/integration-identity.txt
           mkdir -p artifacts
           printf 'Acceptance base: %s\nCI commit: %s\nChanged files:\n%s\n' "$BASE_SHA" "$(git rev-parse HEAD)" "$changed" | tee artifacts/acceptance-base.txt
 
@@ -267,6 +276,44 @@ jobs:
           printf '%s\n' "$result" > artifacts/mariadb-s12-fs12.exit
           exit "$result"
 
+      - name: Prepare disposable family race database
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          db="s12_family_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+          DB_DATABASE="$db" php -r '$name=getenv("DB_DATABASE"); if (!preg_match("/^s12_family_[0-9]+_[0-9]+$/",$name)) exit(1); $pdo=new PDO("mysql:host=".getenv("DB_HOST").";port=".getenv("DB_PORT"),getenv("DB_USERNAME"),getenv("DB_PASSWORD")); $pdo->exec("CREATE DATABASE ".$name);'
+          echo "DB_DATABASE=$db" >> "$GITHUB_ENV"
+          printf "Database: %s\n" "$db" | tee artifacts/mariadb-family-database.txt
+      - name: Verify family database migrations and config
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          php artisan migrate:fresh --force 2>&1 | tee artifacts/mariadb-family-migrations.log
+          php -r '$p=new PDO("mysql:host=".getenv("DB_HOST").";port=".getenv("DB_PORT").";dbname=".getenv("DB_DATABASE"),getenv("DB_USERNAME"),getenv("DB_PASSWORD")); $v=$p->query("SELECT VERSION()")->fetchColumn(); $iso=$p->query("SELECT @@tx_isolation")->fetchColumn(); echo "Version=$v Isolation=$iso APP_ENV=".getenv("APP_ENV")." DB=".getenv("DB_DATABASE")."\n"; if (strpos($v,"MariaDB")===false || strtoupper($iso)!=="REPEATABLE-READ") exit(1); $tables=$p->query("SELECT TABLE_NAME,ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME IN (\x27asab_users\x27,\x27personal_access_tokens\x27,\x27admin_sessions\x27)")->fetchAll(PDO::FETCH_KEY_PAIR); foreach($tables as $t=>$e){echo "$t=$e\n";} if(count($tables)!==3 || count(array_filter($tables,fn($e)=>$e==="InnoDB"))!==3)exit(1);' | tee artifacts/mariadb-family-runtime.txt
+      - name: Run required Family Refresh and stale D08 races
+        if: success()
+        shell: bash
+        run: |
+          set -uo pipefail
+          vendor/bin/phpunit tests/Feature/AdminFamilyConcurrentEvidenceTest.php --log-junit=artifacts/mariadb-family.junit.xml 2>&1 | tee artifacts/mariadb-family.log
+          code=${PIPESTATUS[0]}; echo "$code" > artifacts/mariadb-family.exit; exit "$code"
+      - name: Check Family Refresh and stale D08 JUnit
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+          p=Path("artifacts/mariadb-family.junit.xml")
+          if not p.exists(): raise SystemExit("Missing family JUnit evidence")
+          r=ET.parse(p).getroot(); cases=r.findall(".//testcase")
+          log=Path("artifacts/mariadb-family.log").read_text()
+          assert len(cases)==3 and not (r.findall(".//failure") or r.findall(".//error") or r.findall(".//skipped")), "Family test failures or skips"
+          assert log.count("S12_LOCK_WAIT")>=3 and log.count("S12_FAMILY_CONCURRENCY")>=3, "Missing independent lock evidence"
+          print("Family evidence PASS",len(cases),"cases")
+          PY
       - name: Validate MariaDB tests did not skip and observed required lock waits
         if: always()
         shell: bash
