@@ -51,11 +51,11 @@ class ResolveTenant
             ], 401);
         }
 
-        // F2-A: Validate authoritative business role assignment (Option A — Fail Closed).
+        // F2-A / F2-B: Validate authoritative business role assignment (Deterministic Order).
         // The first persisted assignment defines the primary authoritative grant.
-        $assignment = $user->relationLoaded('roleAssignments')
-            ? $user->roleAssignments->first()
-            : $user->roleAssignments()->orderBy('created_at', 'asc')->orderBy('id', 'asc')->first();
+        $assignment = $user->exists
+            ? $user->roleAssignments()->orderBy('created_at', 'asc')->orderBy('id', 'asc')->first()
+            : ($user->relationLoaded('roleAssignments') ? $user->roleAssignments->sortBy([['created_at', 'asc'], ['id', 'asc']])->first() : null);
 
         if (! $this->isValidAssignment($assignment)) {
             return response()->json([
@@ -71,7 +71,7 @@ class ResolveTenant
         $ctx = app(TenantContext::class);
         $ctx->resolved = true;
         $ctx->companyId = $user->company_id;
-        $ctx->isAdmin = $user->hasAsabRole('admin');
+        $ctx->isAdmin = ($assignment->role_key === 'admin');
 
         $ctx->roleKey = $assignment->role_key;
         $ctx->scope = $assignment->scope;
@@ -98,11 +98,9 @@ class ResolveTenant
             $ctx->branchIds = [];
         }
 
-        // A brand carries a company of its own, so an accountant holding two
-        // brands legitimately spans two companies — the single company_id used
-        // to hide the second one entirely. Platform roles are excluded: their
-        // NULL company is the point, and deriving one would pin them to a tenant.
-        if (! $ctx->isAdmin && ! in_array($ctx->roleKey, TenantContext::PLATFORM_ROLES, true)) {
+        // A brand carries a company of its own, so an accountant (or scoped admin) holding two
+        // brands legitimately spans two companies. Global admin and platform roles are excluded.
+        if (! $ctx->isGlobalAdmin() && ! in_array($ctx->roleKey, TenantContext::PLATFORM_ROLES, true)) {
             $ctx->companyIds = app(TenantCompanyResolver::class)
                 ->resolve($ctx->companyId, $ctx->brandIds, $ctx->restaurantIds);
 
@@ -128,7 +126,7 @@ class ResolveTenant
         // instead of silently missing it.
         $onCompanySurface = $request->is('api/*/company/*');
 
-        if (! $ctx->isAdmin && ! $ctx->hasTenant() && (! $ctx->isPlatform || $onCompanySurface)) {
+        if (! $ctx->isGlobalAdmin() && ! $ctx->hasTenant() && (! $ctx->isPlatform || $onCompanySurface)) {
             return response()->json([
                 'error' => ['code' => 'WRONG_TENANT', 'message' => 'User is not attached to a company', 'messageAr' => 'المستخدم غير مرتبط بشركة'],
                 'requestId' => 'req_'.strtoupper(bin2hex(random_bytes(6))),
