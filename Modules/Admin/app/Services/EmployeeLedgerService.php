@@ -103,6 +103,19 @@ class EmployeeLedgerService
 
         $current = $this->currentBalance($employee->id);
 
+        $pendingSettlement = \Modules\Admin\Models\EmployeeSettlementRequest::where('employee_id', $employee->id)
+            ->where('status', 'pending')
+            ->latest('created_at')
+            ->first();
+
+        $latestSettlement = $pendingSettlement ?? \Modules\Admin\Models\EmployeeSettlementRequest::where('employee_id', $employee->id)
+            ->latest('created_at')
+            ->first();
+
+        $settlementStatus = $pendingSettlement
+            ? 'under_review'
+            : ($latestSettlement?->status === 'approved' ? 'approved' : null);
+
         return [
             'employee' => [
                 'id' => $employee->id, 'name' => $employee->name,
@@ -115,7 +128,9 @@ class EmployeeLedgerService
             'balance' => $current,
             'balanceHalalas' => $current,
             'balanceCaption' => Cat::balanceCaption($current),
+            'hasDebitBalance' => $current < 0,
             'autoDeductFromSalary' => $current < 0,
+            'settlementStatus' => $settlementStatus,
             'totalCredit' => (int) (clone $windowed)->where('movement_type', 'credit')->sum('amount'),
             'totalDebit' => (int) (clone $windowed)->where('movement_type', 'debit')->sum('amount'),
             'movementCount' => $total,
@@ -159,15 +174,34 @@ class EmployeeLedgerService
     }
 
     /**
-     * ACC-7.3 «تسوية الرصيد» — post an opposing `settlement` movement that clears
-     * the standing balance (or a partial amount of it). A debtor (balance < 0)
-     * is settled with a credit; a creditor with a debit. 409 when already zero.
+     * ACC-7.3 / STMT-02 / BE-09 «تسوية الرصيد» — creates a pending settlement request.
+     * Standing balance is NOT credited until Head Accountant approval.
      *
      * @return array<string,mixed>
      */
-    public function settleBalance(Employee $employee, ?int $amount, AsabUser $actor): array
+    public function settleBalance(Employee $employee, ?int $amount, AsabUser $actor, string $reason, ?string $idempotencyKey = null): array
     {
-        return DB::transaction(function () use ($employee, $amount, $actor) {
+        $trimmedReason = trim($reason);
+        if ($trimmedReason === '' || mb_strlen($trimmedReason) < 3) {
+            throw new AsabException(
+                'VALIDATION_ERROR',
+                'A valid reason is mandatory for balance settlement',
+                'سبب التسوية إلزامي',
+                422,
+                ['reason' => ['Reason must be at least 3 characters']],
+            );
+        }
+
+        if ($idempotencyKey) {
+            $existing = \Modules\Admin\Models\EmployeeSettlementRequest::where('company_id', $employee->company_id)
+                ->where('idempotency_key', $idempotencyKey)
+                ->first();
+            if ($existing) {
+                return $this->formatSettlementResponse($existing, $this->currentBalance($employee->id));
+            }
+        }
+
+        return DB::transaction(function () use ($employee, $amount, $actor, $trimmedReason, $idempotencyKey) {
             $balance = $this->currentBalance($employee->id);
             if ($balance === 0) {
                 throw new AsabException('BALANCE_ALREADY_SETTLED', 'Balance is already zero', 'الرصيد صفر بالفعل', 409);
@@ -185,33 +219,117 @@ class EmployeeLedgerService
                 );
             }
 
+            $request = \Modules\Admin\Models\EmployeeSettlementRequest::create([
+                'company_id' => $employee->company_id,
+                'employee_id' => $employee->id,
+                'amount_halalas' => $settle,
+                'reason' => $trimmedReason,
+                'status' => 'pending',
+                'created_by_user_id' => $actor->id,
+                'idempotency_key' => $idempotencyKey,
+            ]);
+
+            return $this->formatSettlementResponse($request, $balance);
+        });
+    }
+
+    /**
+     * BE-09 / STMT-02 Head Accountant approval: posts the opposing ledger movement and marks request approved.
+     *
+     * @return array<string,mixed>
+     */
+    public function approveSettlement(string $id, AsabUser $reviewer): array
+    {
+        return DB::transaction(function () use ($id, $reviewer) {
+            $req = \Modules\Admin\Models\EmployeeSettlementRequest::where('company_id', $reviewer->company_id)
+                ->lockForUpdate()
+                ->findOrFail($id);
+
+            if ($req->status !== 'pending') {
+                throw new AsabException('REQUEST_ALREADY_PROCESSED', 'Settlement request is already '.$req->status, 'تمت معالجة طلب التسوية مسبقاً', 409);
+            }
+
+            $employee = Employee::findOrFail($req->employee_id);
+            $balance = $this->currentBalance($employee->id);
+
             // Debtor (negative) → credit clears it; creditor (positive) → debit.
             $type = $balance < 0 ? 'credit' : 'debit';
             $movement = EmployeeMovement::create([
                 'employee_id' => $employee->id,
                 'movement_type' => $type,
-                'amount' => $settle,
+                'amount' => $req->amount_halalas,
                 'category' => 'settlement',
                 'ref' => Cat::makeRef('settlement', (string) Str::uuid()),
-                'description' => 'تسوية رصيد — '.$employee->name,
+                'description' => 'تسوية رصيد معتمدة — '.$employee->name.' — '.$req->reason,
                 'movement_date' => now(),
-                'created_by_id' => $actor->id,
+                'created_by_id' => $reviewer->id,
+            ]);
+
+            $req->update([
+                'status' => 'approved',
+                'reviewed_by_user_id' => $reviewer->id,
+                'reviewed_at' => now(),
+                'movement_id' => $movement->id,
             ]);
 
             $newBalance = $this->currentBalance($employee->id);
 
-            return [
-                'id' => $movement->id,
-                'employeeId' => $employee->id,
-                'settledHalalas' => $settle,
-                'movementType' => $type,
-                'category' => 'settlement',
-                'categoryLabelAr' => Cat::labelAr('settlement'),
-                'ref' => $movement->ref,
-                'balanceHalalas' => $newBalance,
-                'balanceCaption' => Cat::balanceCaption($newBalance),
-            ];
+            $res = $this->formatSettlementResponse($req, $newBalance);
+            $res['movementType'] = $type;
+            $res['category'] = 'settlement';
+            $res['categoryLabelAr'] = Cat::labelAr('settlement');
+            $res['ref'] = $movement->ref;
+
+            return $res;
         });
+    }
+
+    /**
+     * BE-09 / STMT-02 Head Accountant rejection: transitions status to rejected without ledger posting.
+     *
+     * @return array<string,mixed>
+     */
+    public function rejectSettlement(string $id, ?string $rejectionReason, AsabUser $reviewer): array
+    {
+        return DB::transaction(function () use ($id, $rejectionReason, $reviewer) {
+            $req = \Modules\Admin\Models\EmployeeSettlementRequest::where('company_id', $reviewer->company_id)
+                ->lockForUpdate()
+                ->findOrFail($id);
+
+            if ($req->status !== 'pending') {
+                throw new AsabException('REQUEST_ALREADY_PROCESSED', 'Settlement request is already '.$req->status, 'تمت معالجة طلب التسوية مسبقاً', 409);
+            }
+
+            $req->update([
+                'status' => 'rejected',
+                'rejection_reason' => $rejectionReason,
+                'reviewed_by_user_id' => $reviewer->id,
+                'reviewed_at' => now(),
+            ]);
+
+            return $this->formatSettlementResponse($req);
+        });
+    }
+
+    public function formatSettlementResponse(\Modules\Admin\Models\EmployeeSettlementRequest $req, ?int $balance = null): array
+    {
+        return [
+            'id' => $req->id,
+            'settlementId' => $req->id,
+            'companyId' => $req->company_id,
+            'employeeId' => $req->employee_id,
+            'amountHalalas' => (int) $req->amount_halalas,
+            'reason' => $req->reason,
+            'status' => $req->status,
+            'rejectionReason' => $req->rejection_reason,
+            'createdByUserId' => $req->created_by_user_id,
+            'reviewedByUserId' => $req->reviewed_by_user_id,
+            'reviewedAt' => $req->reviewed_at?->toIso8601String(),
+            'movementId' => $req->movement_id,
+            'balanceModified' => $req->status === 'approved',
+            'balanceHalalas' => $balance !== null ? $balance : $this->currentBalance($req->employee_id),
+            'createdAt' => $req->created_at?->toIso8601String(),
+        ];
     }
 
     /**
