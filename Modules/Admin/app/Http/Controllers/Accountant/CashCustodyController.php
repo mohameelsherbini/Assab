@@ -91,51 +91,12 @@ class CashCustodyController extends AsabController
      */
     public function addTransaction(Request $request, string $id): JsonResponse
     {
-        return $this->run(function () use ($request, $id) {
-            $custody = $this->scopeToAssignedBranches(CashCustody::query())->findOrFail($id);
-            $data = $request->validate([
-                'txnType' => 'required|in:credit,debit',
-                'amount' => 'required|integer|min:1',
-                'description' => 'nullable|string|max:255',
-                'date' => 'nullable|date',
-                'status' => 'nullable|in:pending,approved',
-                'source' => 'nullable|in:treasury,manual',
-            ]);
-            $status = $data['status'] ?? 'approved';
-            $apply = $status === 'approved';
-            $source = $data['source'] ?? 'manual';
-
-            // A treasury credit is a تعزيز عهدة top-up — default its description.
-            $description = $data['description']
-                ?? ($data['txnType'] === 'credit' && $source === 'treasury'
-                    ? 'تعزيز عهدة من الخزينة'
-                    : 'حركة عهدة');
-
-            $txn = DB::transaction(function () use ($custody, $data, $status, $apply, $source, $description, $request) {
-                if ($apply && $data['txnType'] === 'debit') {
-                    $this->custody->assertNotOverdrawn($custody, (int) $data['amount']);
-                }
-                $txn = CashTransaction::create([
-                    'custody_id' => $custody->id,
-                    'txn_type' => $data['txnType'],
-                    'amount' => (int) $data['amount'],
-                    'description' => $description,
-                    'txn_date' => $data['date'] ?? now(),
-                    'status' => $status,
-                    'source' => $source,
-                    'created_by_id' => $request->user()->id,
-                ]);
-                if ($apply) {
-                    $this->custody->applyTxn($custody, $txn);
-                }
-
-                return $txn;
-            });
-
-            return $this->created([
-                'id' => $txn->id, 'status' => $txn->status, 'txnType' => $txn->txn_type,
-                'amountHalalas' => (int) $txn->amount, 'source' => $txn->source,
-            ]);
-        });
+        return $this->fail(
+            'CUSTODY_MANUAL_WRITE_PROHIBITED',
+            'Manual custody transaction writes are prohibited under interim policy FUND-04/06.',
+            'تعديل حركات العهدة اليدوية محظور بموجب السياسة المؤقتة',
+            [],
+            403
+        );
     }
 }

@@ -744,27 +744,13 @@ class AccountantCompanyController extends AsabController
      */
     public function approveTransaction(Request $request, string $id, string $txnId): JsonResponse
     {
-        return $this->run(function () use ($request, $id, $txnId) {
-            $custody = $this->scopeToAssignedBranches(CashCustody::whereIn('company_id', $this->tenantCompanyIdsFor($request->user())))->findOrFail($id);
-            $txn = CashTransaction::where('custody_id', $custody->id)->findOrFail($txnId);
-
-            if ($txn->status === 'rejected') {
-                throw new AsabException('TXN_REJECTED', 'A rejected transaction cannot be approved', 'لا يمكن اعتماد حركة مرفوضة', 409, ['status' => $txn->status]);
-            }
-            if ($txn->status === 'approved') {
-                return $this->ok(['id' => $txn->id, 'status' => 'approved']); // already applied
-            }
-
-            DB::transaction(function () use ($custody, $txn) {
-                if ($txn->txn_type === 'debit') {
-                    $this->custody->assertNotOverdrawn($custody, (int) $txn->amount);
-                }
-                $txn->update(['status' => 'approved']);
-                $this->custody->applyTxn($custody, $txn);
-            });
-
-            return $this->ok(['id' => $txn->id, 'status' => 'approved']);
-        });
+        return $this->fail(
+            'CUSTODY_MANUAL_WRITE_PROHIBITED',
+            'Manual custody approvals are prohibited under interim policy FUND-04/06.',
+            'اعتماد حركات العهدة اليدوية محظور بموجب السياسة المؤقتة',
+            [],
+            403
+        );
     }
 
     /**
@@ -801,47 +787,13 @@ class AccountantCompanyController extends AsabController
      */
     public function settleCustody(Request $request, string $id): JsonResponse
     {
-        return $this->run(function () use ($request, $id) {
-            $data = $request->validate(['newDepositHalalas' => 'sometimes|integer|min:0']);
-            $custody = $this->scopeToAssignedBranches(CashCustody::whereIn('company_id', $this->tenantCompanyIdsFor($request->user())))->findOrFail($id);
-
-            DB::transaction(function () use ($custody, $data, $request) {
-                $usedBefore = (int) $custody->used;
-                $deposit = (int) ($data['newDepositHalalas'] ?? 0);
-
-                // Audit trail: a settlement debit clears the spent portion; an
-                // optional deposit credit records the top-up.
-                if ($usedBefore > 0) {
-                    CashTransaction::create([
-                        'custody_id' => $custody->id, 'txn_type' => 'debit', 'amount' => $usedBefore,
-                        'description' => 'تسوية العهدة — إغلاق المصروف', 'txn_date' => now(),
-                        'status' => 'approved', 'source' => 'manual', 'created_by_id' => $request->user()->id,
-                    ]);
-                }
-                if ($deposit > 0) {
-                    CashTransaction::create([
-                        'custody_id' => $custody->id, 'txn_type' => 'credit', 'amount' => $deposit,
-                        'description' => 'تسوية العهدة — إيداع جديد', 'txn_date' => now(),
-                        'status' => 'approved', 'source' => 'treasury', 'created_by_id' => $request->user()->id,
-                    ]);
-                }
-
-                $custody->update([
-                    'used' => 0, 'last_settlement_at' => now(), 'days_since_settlement' => 0,
-                    'amount' => (int) $custody->amount + $deposit,
-                ]);
-
-                // Close any pending settlement requests this settlement fulfils.
-                SettlementRequest::where('custody_id', $custody->id)->where('status', 'pending')
-                    ->update(['status' => 'approved', 'approved_at' => now()]);
-
-                $this->custody->recompute($custody->refresh(), notify: false);
-            });
-
-            $custody->refresh();
-
-            return $this->ok(['id' => $custody->id, 'amountHalalas' => (int) $custody->amount, 'usedHalalas' => 0]);
-        });
+        return $this->fail(
+            'CUSTODY_MANUAL_WRITE_PROHIBITED',
+            'Manual custody settlements are prohibited under interim policy FUND-04/06.',
+            'تسوية العهدة اليدوية محظورة بموجب السياسة المؤقتة',
+            [],
+            403
+        );
     }
 
     private function expenseOp(Request $request, string $invoiceId): Operation

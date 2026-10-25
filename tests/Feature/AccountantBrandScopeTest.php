@@ -198,15 +198,11 @@ class AccountantBrandScopeTest extends TestCase
         $this->assertSame([$custodyA->id], collect($index->json('data'))->pluck('id')->all());
 
         $payload = ['txnType' => 'debit', 'amount' => 500, 'description' => 'مشتريات'];
-        $this->asAccountant()->postJson("/api/v1/accountant/cash-custody/{$custodyB->id}/transactions", $payload)->assertStatus(404);
-        $this->assertSame(0, $custodyB->fresh()->used);
+        // Under BE-10 / FUND-04/06, accountant manual writes and settlements return 403 Forbidden
+        $this->asAccountant()->postJson("/api/v1/accountant/cash-custody/{$custodyA->id}/transactions", $payload)->assertStatus(403);
+        $this->assertSame(0, $custodyA->fresh()->used);
 
-        $this->asAccountant()->postJson("/api/v1/accountant/cash-custody/{$custodyA->id}/transactions", $payload)->assertStatus(201);
-        $this->assertSame(500, $custodyA->fresh()->used);
-
-        // company/me settle variant
-        $this->asAccountant()->postJson("/api/v1/company/me/cash-custody/{$custodyB->id}/settle", [])->assertStatus(404);
-        $this->asAccountant()->postJson("/api/v1/company/me/cash-custody/{$custodyA->id}/settle", [])->assertStatus(200);
+        $this->asAccountant()->postJson("/api/v1/company/me/cash-custody/{$custodyA->id}/settle", [])->assertStatus(403);
     }
 
     // ---- Employees ----
