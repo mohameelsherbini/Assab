@@ -588,7 +588,14 @@ class NewOrderController extends BaseController
                 return $this->notFoundResponse('Order not found');
             }
 
-            $this->orderService->updateItems($order, $request->get('items', []));
+            $items = $request->get('items', []);
+
+            // PUR-03 (BE-25): Restrict purchase order quantity increases and price modifications to authorized procurement managers
+            if (! $this->isAuthorizedForPriceOrQuantityIncrease(auth()->user(), $order, $items)) {
+                return $this->errorResponse('Only authorized procurement managers may alter purchase order prices or increase quantities.', 403);
+            }
+
+            $this->orderService->updateItems($order, $items);
 
             return $this->successResponse(
                 new PurchaseOrderResource($order->fresh(['items'])),
@@ -597,6 +604,98 @@ class NewOrderController extends BaseController
         } catch (\Exception $e) {
             return $this->handleException($e, 'updating order items');
         }
+    }
+
+    /**
+     * Verify whether user is authorized to alter prices or increase order quantities (PUR-03, BE-25).
+     */
+    public function isAuthorizedForPriceOrQuantityIncrease($user, \Modules\Purchase\Models\PurchaseOrder $order, array $items): bool
+    {
+        if (! $user) {
+            return false;
+        }
+
+        $order->loadMissing('items');
+        $existingItems = $order->items->keyBy('id');
+
+        $hasRestrictedModification = false;
+
+        foreach ($items as $itemData) {
+            $itemId = $itemData['id'] ?? null;
+            if (! $itemId || ! $existingItems->has($itemId)) {
+                $hasRestrictedModification = true;
+                break;
+            }
+
+            $existing = $existingItems->get($itemId);
+
+            // Check price modification
+            if (isset($itemData['unit_price']) && abs((float) $itemData['unit_price'] - (float) $existing->unit_price) > 0.0001) {
+                $hasRestrictedModification = true;
+                break;
+            }
+
+            // Check quantity increase
+            if (isset($itemData['quantity']) && (float) $itemData['quantity'] > (float) $existing->quantity_ordered) {
+                $hasRestrictedModification = true;
+                break;
+            }
+        }
+
+        if (! $hasRestrictedModification) {
+            return true;
+        }
+
+        return $this->hasProcurementManagementAuthority($user);
+    }
+
+    /**
+     * Check if user possesses procurement manager or higher administrative authority (PUR-03).
+     */
+    public function hasProcurementManagementAuthority($user): bool
+    {
+        $authorizedRoles = [
+            'procurement_manager',
+            'purchasing_manager',
+            'head_accountant',
+            'head',
+            'admin',
+            'general_manager',
+            'super_admin',
+        ];
+
+        // 1. Check CompanyUser membership
+        $cu = \Modules\Admin\Models\CompanyUser::where('user_id', $user->id)
+            ->where('status', '!=', 'inactive')
+            ->where('status', '!=', 'archived')
+            ->first();
+
+        if ($cu && in_array(strtolower((string) $cu->role_key), $authorizedRoles, true)) {
+            return true;
+        }
+
+        // 2. Check AsabUserRole
+        $userRole = \Modules\Admin\Models\AsabUserRole::where('user_id', $user->id)->first();
+        if ($userRole && in_array(strtolower((string) $userRole->role_key), $authorizedRoles, true)) {
+            return true;
+        }
+
+        // 3. Check direct roles collection if available
+        if (isset($user->roles) && is_iterable($user->roles)) {
+            $roles = collect($user->roles)->pluck('name')->map(fn ($n) => strtolower((string) $n))->all();
+            foreach ($authorizedRoles as $authRole) {
+                if (in_array($authRole, $roles, true)) {
+                    return true;
+                }
+            }
+        }
+
+        // 4. Check user attributes
+        if (isset($user->role) && in_array(strtolower((string) $user->role), $authorizedRoles, true)) {
+            return true;
+        }
+
+        return false;
     }
 
     /**
