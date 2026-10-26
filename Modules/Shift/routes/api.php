@@ -27,6 +27,14 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::post('shift-transfer-attempts/{attempt}/confirm-receipt', [$controller, 'receipt']);
     Route::post('shift-transfer-returns/{return}/confirm', [$controller, 'confirm']);
     Route::post('shift-reports/{shift}/recount', [$controller, 'recount']);
+
+    // CASH-14 / BE-13: Two-party cash handover reversal dispute/confirmation
+    Route::post('shifts/handovers/{handover}/reversal-disputes', [\Modules\Shift\Http\Controllers\HandoverSettlementController::class, 'initiateReversalDispute'])
+        ->name('shifts.handovers.reversal-disputes');
+    Route::post('shifts/handovers/reversals/{reversal}/confirm', [\Modules\Shift\Http\Controllers\HandoverSettlementController::class, 'confirmReversal'])
+        ->name('shifts.handovers.reversals.confirm');
+    Route::post('shifts/handovers/reversals/{reversal}/reject', [\Modules\Shift\Http\Controllers\HandoverSettlementController::class, 'rejectReversal'])
+        ->name('shifts.handovers.reversals.reject');
 });
 
 /*

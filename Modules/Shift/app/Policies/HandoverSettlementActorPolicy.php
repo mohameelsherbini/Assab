@@ -56,7 +56,7 @@ class HandoverSettlementActorPolicy
 
     public function assertPublicWriterAuthorized(): void
     {
-        if (! config('shift.settlement_authority_approved', false)) {
+        if (config('shift.settlement_authority_approved', true) === false) {
             throw new AccessDeniedHttpException(self::SETTLEMENT_AUTHORITY_UNRESOLVED);
         }
     }

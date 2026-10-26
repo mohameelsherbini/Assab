@@ -8,7 +8,9 @@ use Illuminate\Routing\Controller;
 use Illuminate\Support\Facades\Validator;
 use Illuminate\Support\Str;
 use Modules\Admin\Services\CommandIdempotencyContext;
+use Modules\Shift\Models\CashierShiftHandover;
 use Modules\Shift\Models\CashierShiftHandoverReceipt;
+use Modules\Shift\Models\ShiftHandoverReversal;
 use Modules\Shift\Models\ShiftHandoverSettlement;
 use Modules\Shift\Services\HandoverSettlementService;
 use Modules\Shift\Transformers\ShiftHandoverSettlementResource;
@@ -156,6 +158,132 @@ class HandoverSettlementController extends Controller
             ]);
         } catch (\Throwable $e) {
             return HandoverErrorResponse::from($e, 'index_settlements');
+        }
+    }
+
+    /**
+     * CASH-14 / BE-13: Recipient initiates two-party handover reversal dispute.
+     */
+    public function initiateReversalDispute(Request $request, string $handoverId): Response
+    {
+        try {
+            $actor = auth()->user();
+            if (! $actor) {
+                return HandoverErrorResponse::domain('UNAUTHORIZED_ACTOR', 403);
+            }
+
+            $validator = Validator::make($request->all(), [
+                'reason' => 'required|string|min:1|max:1000',
+            ]);
+
+            if ($validator->fails()) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Validation failed',
+                    'code' => 'VALIDATION_ERROR',
+                    'errors' => $validator->errors(),
+                ], 422);
+            }
+
+            $handover = CashierShiftHandover::findOrFail($handoverId);
+
+            $reversal = $this->settlementService->initiateReversal(
+                $handover,
+                $actor,
+                (string) $request->input('reason')
+            );
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Reversal dispute initiated successfully',
+                'reversalId' => $reversal->id,
+                'originalHandoverId' => $handover->id,
+                'status' => $reversal->status,
+                'data' => [
+                    'reversalId' => $reversal->id,
+                    'reversal_id' => $reversal->id,
+                    'originalHandoverId' => $handover->id,
+                    'original_handover_id' => $handover->id,
+                    'status' => $reversal->status,
+                    'reversal_reason' => $reversal->reversal_reason,
+                    'initiated_by_user_id' => $reversal->initiated_by_user_id,
+                    'created_at' => $reversal->created_at,
+                ],
+            ], 201);
+        } catch (\Throwable $e) {
+            return HandoverErrorResponse::from($e, 'initiateReversalDispute');
+        }
+    }
+
+    /**
+     * CASH-14 / BE-13: Original sender confirms two-party handover reversal.
+     */
+    public function confirmReversal(Request $request, string $reversalId): Response
+    {
+        try {
+            $actor = auth()->user();
+            if (! $actor) {
+                return HandoverErrorResponse::domain('UNAUTHORIZED_ACTOR', 403);
+            }
+
+            $reversal = ShiftHandoverReversal::findOrFail($reversalId);
+
+            $result = $this->settlementService->confirmReversal($reversal, $actor);
+            $confirmedReversal = $result['reversal'];
+            $amountHalalas = $result['reversed_amount_halalas'];
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Reversal confirmed successfully',
+                'reversalId' => $confirmedReversal->id,
+                'status' => 'confirmed',
+                'reversedAmountHalalas' => $amountHalalas,
+                'data' => [
+                    'reversalId' => $confirmedReversal->id,
+                    'reversal_id' => $confirmedReversal->id,
+                    'status' => 'confirmed',
+                    'reversedAmountHalalas' => $amountHalalas,
+                    'confirmed_by_user_id' => $confirmedReversal->confirmed_by_user_id,
+                    'confirmed_at' => $confirmedReversal->confirmed_at,
+                ],
+            ], 200);
+        } catch (\Throwable $e) {
+            return HandoverErrorResponse::from($e, 'confirmReversal');
+        }
+    }
+
+    /**
+     * CASH-14 / BE-13: Original sender rejects two-party handover reversal.
+     */
+    public function rejectReversal(Request $request, string $reversalId): Response
+    {
+        try {
+            $actor = auth()->user();
+            if (! $actor) {
+                return HandoverErrorResponse::domain('UNAUTHORIZED_ACTOR', 403);
+            }
+
+            $reversal = ShiftHandoverReversal::findOrFail($reversalId);
+
+            $rejectedReversal = $this->settlementService->rejectReversal(
+                $reversal,
+                $actor,
+                $request->input('rejection_reason')
+            );
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Reversal rejected',
+                'reversalId' => $rejectedReversal->id,
+                'status' => 'rejected',
+                'data' => [
+                    'reversalId' => $rejectedReversal->id,
+                    'reversal_id' => $rejectedReversal->id,
+                    'status' => 'rejected',
+                ],
+            ], 200);
+        } catch (\Throwable $e) {
+            return HandoverErrorResponse::from($e, 'rejectReversal');
         }
     }
 }
