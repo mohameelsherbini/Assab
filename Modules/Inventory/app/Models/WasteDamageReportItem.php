@@ -35,6 +35,8 @@ class WasteDamageReportItem extends Model
         'justification_text',
         'photo_path',
         'price_per_unit',
+        'unit_cost_halalas',
+        'total_cost_halalas',
     ];
 
     protected $casts = [
@@ -44,6 +46,8 @@ class WasteDamageReportItem extends Model
         'quantity' => 'decimal:3',
         'total_value' => 'decimal:2',
         'price_per_unit' => 'decimal:2',
+        'unit_cost_halalas' => 'integer',
+        'total_cost_halalas' => 'integer',
     ];
 
     public function wasteDamageReport(): BelongsTo

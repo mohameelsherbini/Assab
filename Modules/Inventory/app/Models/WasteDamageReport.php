@@ -31,6 +31,10 @@ class WasteDamageReport extends Model
         'assigned_to_type',
         'assigned_to_id',
         'status',
+        'financial_recognized',
+        'financial_recognized_at',
+        'financial_approved_by',
+        'total_financial_loss_halalas',
         'submitted_at',
         'approved_at',
         'approved_by',
@@ -42,6 +46,9 @@ class WasteDamageReport extends Model
 
     protected $casts = [
         'status' => WasteDamageReportStatus::class,
+        'financial_recognized' => 'boolean',
+        'financial_recognized_at' => 'datetime',
+        'total_financial_loss_halalas' => 'integer',
         'submitted_at' => 'datetime',
         'approved_at' => 'datetime',
         'rejected_at' => 'datetime',
