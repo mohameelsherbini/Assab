@@ -15,6 +15,7 @@ use Modules\Expense\Enums\PaymentMethod;
 use Modules\Expense\Repositories\ExpenseRepository;
 use Modules\Expense\Services\ExpenseApprovalService;
 use Modules\Expense\Services\ExpenseBrandScopeService;
+use Modules\Expense\Services\ExpenseDelegationService;
 use Modules\Expense\Services\ExpenseHelperService;
 use Modules\Expense\Transformers\ExpenseDetailResource;
 use Modules\Expense\Transformers\ExpenseResource;
@@ -190,7 +191,7 @@ class ExpenseController extends BaseController
     {
         $expenseModel = $this->expenseRepository->findOrFail($expense);
 
-        if ($expenseModel->branch_manager_id !== auth()->id()) {
+        if (! ExpenseDelegationService::isAuthorizedForExpense($expenseModel->branch_manager_id)) {
             return $this->errorResponse('Unauthorized access', 403);
         }
 
@@ -211,7 +212,7 @@ class ExpenseController extends BaseController
     public function drafts(Request $request): JsonResponse
     {
         $drafts = $this->expenseRepository->getDraftsPaginated(
-            auth()->id(),
+            ExpenseDelegationService::resolveActingBranchManagerId(),
             (int) $request->input('per_page', 20)
         );
 
@@ -230,7 +231,7 @@ class ExpenseController extends BaseController
         try {
             $expenseModel = $this->expenseRepository->findOrFail($expense);
 
-            if ($expenseModel->branch_manager_id !== auth()->id()) {
+            if (! ExpenseDelegationService::isAuthorizedForExpense($expenseModel->branch_manager_id)) {
                 return $this->errorResponse('Unauthorized', 403);
             }
 
@@ -254,7 +255,7 @@ class ExpenseController extends BaseController
         try {
             $expenseModel = $this->expenseRepository->findOrFail($expense);
 
-            if ($expenseModel->branch_manager_id !== auth()->id()) {
+            if (! ExpenseDelegationService::isAuthorizedForExpense($expenseModel->branch_manager_id)) {
                 return $this->errorResponse('Unauthorized', 403);
             }
 
@@ -277,7 +278,7 @@ class ExpenseController extends BaseController
     {
         $expenseModel = $this->expenseRepository->findOrFail($expense);
 
-        if ($expenseModel->branch_manager_id !== auth()->id()) {
+        if (! ExpenseDelegationService::isAuthorizedForExpense($expenseModel->branch_manager_id)) {
             return $this->errorResponse('Unauthorized', 403);
         }
 

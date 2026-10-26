@@ -11,6 +11,7 @@ use Illuminate\Support\Facades\Validator;
 use Modules\Custody\Exceptions\InsufficientExpenseCustodyException;
 use Modules\Expense\Http\Concerns\RespondsToInsufficientCustody;
 use Modules\Expense\Models\Expense;
+use Modules\Expense\Services\ExpenseDelegationService;
 use Modules\Expense\Services\ExpenseOriginGuard;
 use Modules\Expense\Services\QuickCashExpenseService;
 use Modules\Expense\Transformers\ExpenseDetailResource;
@@ -70,7 +71,8 @@ class QuickCashExpenseController extends BaseController
 
         // F-04: refuse a submission (non-draft) whose immutable origin cannot be
         // fully/consistently resolved — before any write, event, or transaction.
-        ExpenseOriginGuard::assertResolvableForCreation(auth()->id(), $request->boolean('is_draft'));
+        $managerId = ExpenseDelegationService::resolveActingBranchManagerId();
+        ExpenseOriginGuard::assertResolvableForCreation($managerId, $request->boolean('is_draft'));
 
         // Validate items total equals total_amount
         $itemsTotal = collect($request->items ?? [])->sum('amount');
@@ -83,7 +85,7 @@ class QuickCashExpenseController extends BaseController
 
         // Check custody balance if payment method is custody
         if ($request->payment_method === 'custody') {
-            $custodyBalance = $this->quickCashService->getCustodyBalance(auth()->id());
+            $custodyBalance = $this->quickCashService->getCustodyBalance($managerId);
             if ($custodyBalance < $request->total_amount) {
                 return $this->errorResponse(
                     'Insufficient custody balance',
@@ -126,7 +128,7 @@ class QuickCashExpenseController extends BaseController
         $expenseModel = Expense::with(['quickCashExpense', 'quickCashExpense.items', 'quickCashExpense.paymentSupplier', 'attachments'])
             ->findOrFail($expense);
 
-        if ($expenseModel->branch_manager_id !== auth()->id()) {
+        if (! ExpenseDelegationService::isAuthorizedForExpense($expenseModel->branch_manager_id)) {
             return $this->errorResponse(
                 'Unauthorized access to this expense',
                 403
@@ -194,7 +196,8 @@ class QuickCashExpenseController extends BaseController
         // Check custody balance if payment method changed to custody
         if ($request->payment_method === 'custody') {
             $totalAmount = $request->total_amount ?? $expenseModel->total_amount;
-            $custodyBalance = $this->quickCashService->getCustodyBalance(auth()->id());
+            $managerId = ExpenseDelegationService::resolveActingBranchManagerId();
+            $custodyBalance = $this->quickCashService->getCustodyBalance($managerId);
             if ($custodyBalance < $totalAmount) {
                 return $this->errorResponse(
                     'Insufficient custody balance',

@@ -173,4 +173,112 @@ class CashierExpenseWriteDelegationTest extends TestCase
 
         $this->assertSame($before, $this->snapshot());
     }
+
+    /** EXP-09: Branch Manager can grant and revoke expense delegation to cashiers within their branch. */
+    public function test_branch_manager_can_grant_and_revoke_delegation_to_same_branch_cashier(): void
+    {
+        // 1. Grant delegation
+        $response = $this->actingAs($this->bmA1, 'sanctum')
+            ->postJson("/api/branch-manager/cashiers/{$this->cashier->id}/expense-delegation/grant");
+
+        $response->assertOk()
+            ->assertJsonPath('success', true)
+            ->assertJsonPath('data.is_active', true);
+
+        $this->assertDatabaseHas('branch_cashier_expense_delegations', [
+            'branch_id' => $this->branchA1->id,
+            'cashier_user_id' => $this->cashier->id,
+            'granted_by_user_id' => $this->bmA1->id,
+            'is_active' => true,
+        ]);
+
+        // 2. Revoke delegation
+        $revokeResponse = $this->actingAs($this->bmA1, 'sanctum')
+            ->postJson("/api/branch-manager/cashiers/{$this->cashier->id}/expense-delegation/revoke");
+
+        $revokeResponse->assertOk()
+            ->assertJsonPath('success', true)
+            ->assertJsonPath('data.is_active', false);
+
+        $this->assertDatabaseHas('branch_cashier_expense_delegations', [
+            'branch_id' => $this->branchA1->id,
+            'cashier_user_id' => $this->cashier->id,
+            'is_active' => false,
+        ]);
+    }
+
+    /** EXP-09: Cross-branch delegation attempts are prohibited with HTTP 403. */
+    public function test_branch_manager_cannot_delegate_to_cross_branch_cashier(): void
+    {
+        $crossBranchCashier = Cashier::factory()->create(['branch_id' => $this->branchB1->id, 'created_by' => $this->bmB1->id]);
+
+        $response = $this->actingAs($this->bmA1, 'sanctum')
+            ->postJson("/api/branch-manager/cashiers/{$crossBranchCashier->id}/expense-delegation/grant");
+
+        $response->assertForbidden()
+            ->assertJsonPath('success', false)
+            ->assertJsonPath('errors.code', 'CROSS_BRANCH_DELEGATION_PROHIBITED');
+    }
+
+    /** EXP-09: A cashier with active delegation can create and submit expenses funded by branch custody. */
+    public function test_cashier_with_active_delegation_can_create_and_submit_expense(): void
+    {
+        // Grant active delegation
+        $this->actingAs($this->bmA1, 'sanctum')
+            ->postJson("/api/branch-manager/cashiers/{$this->cashier->id}/expense-delegation/grant")
+            ->assertOk();
+
+        // Cashier submits expense
+        $response = $this->actingAs($this->cashier, 'sanctum')
+            ->postJson('/api/branch-manager/expenses/quick-cash', [
+                'expense_date' => now()->toDateString(),
+                'expense_name' => 'مصروف مفوض للكاشير',
+                'total_amount' => 120,
+                'payment_method' => 'custody',
+                'is_draft' => false,
+                'items' => [['title' => 'شراء مستلزمات', 'amount' => 120]],
+            ]);
+
+        $response->assertCreated()
+            ->assertJsonPath('success', true);
+
+        $expenseId = $response->json('data.id');
+        $this->assertNotNull($expenseId);
+
+        $expense = Expense::withoutGlobalScopes()->find($expenseId);
+        $this->assertNotNull($expense);
+        $this->assertSame('pending', $expense->status);
+        $this->assertSame((string) $this->bmA1->id, (string) $expense->branch_manager_id);
+
+        // Branch custody was charged once for the delegated expense
+        $rows = CustodyTransaction::withoutGlobalScopes()->where('related_expense_id', $expenseId)->get();
+        $this->assertCount(1, $rows);
+        $this->assertSame('120.00', (string) $rows->first()->amount);
+        $this->assertFalse((bool) $rows->first()->is_cash_in);
+    }
+
+    /** EXP-09: When delegation is revoked, cashier expense writes are blocked immediately. */
+    public function test_cashier_with_revoked_delegation_is_blocked_immediately(): void
+    {
+        // Grant then revoke
+        $this->actingAs($this->bmA1, 'sanctum')
+            ->postJson("/api/branch-manager/cashiers/{$this->cashier->id}/expense-delegation/grant")
+            ->assertOk();
+
+        $this->actingAs($this->bmA1, 'sanctum')
+            ->postJson("/api/branch-manager/cashiers/{$this->cashier->id}/expense-delegation/revoke")
+            ->assertOk();
+
+        // Subsequent submission blocked
+        $this->assertDelegationRequired(
+            $this->actingAs($this->cashier, 'sanctum')->postJson('/api/branch-manager/expenses/quick-cash', [
+                'expense_date' => now()->toDateString(),
+                'expense_name' => 'محاولة بعد الإلغاء',
+                'total_amount' => 50,
+                'payment_method' => 'custody',
+                'is_draft' => false,
+                'items' => [['title' => 'بند', 'amount' => 50]],
+            ])
+        );
+    }
 }

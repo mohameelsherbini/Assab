@@ -36,7 +36,7 @@ class QuickCashExpenseService
         }
 
         $expense = Expense::create([
-            'branch_manager_id' => auth()->id(),
+            'branch_manager_id' => ExpenseDelegationService::resolveActingBranchManagerId(),
             'expense_type' => 'quick_cash',
             'status' => $data['is_draft'] ?? false ? 'draft' : 'pending',
             'submitted_at' => ($data['is_draft'] ?? false) ? null : now(),

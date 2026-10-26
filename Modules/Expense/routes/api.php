@@ -9,6 +9,7 @@ use Modules\Expense\Http\Controllers\GroupedInvoiceExpenseController;
 use Modules\Expense\Http\Controllers\PreApprovalRequestController;
 use Modules\Expense\Http\Controllers\QuickCashExpenseController;
 use Modules\Expense\Http\Controllers\SingleInvoiceExpenseController;
+use Modules\Expense\Http\Controllers\ExpenseDelegationController;
 use Modules\Expense\Http\Controllers\SupplierController;
 
 /*
@@ -195,4 +196,20 @@ Route::prefix('brand-owner/expenses')
 
         // Timeline
         Route::get('/{expense}/timeline', [ExpenseApprovalController::class, 'timeline']);
+    });
+
+/*
+|--------------------------------------------------------------------------
+| Branch Manager - Cashier Expense Write Delegation (EXP-09, BE-17)
+|--------------------------------------------------------------------------
+*/
+Route::prefix('branch-manager')
+    ->middleware(['auth:sanctum'])
+    ->group(function () {
+        Route::post('cashiers/{cashier}/expense-delegation/grant', [ExpenseDelegationController::class, 'grant']);
+        Route::post('cashiers/{cashier}/expense-delegation/revoke', [ExpenseDelegationController::class, 'revoke']);
+        Route::get('cashiers/{cashier}/expense-delegation/status', [ExpenseDelegationController::class, 'status']);
+
+        Route::post('expenses/delegations/{cashier}/grant', [ExpenseDelegationController::class, 'grant']);
+        Route::post('expenses/delegations/{cashier}/revoke', [ExpenseDelegationController::class, 'revoke']);
     });
