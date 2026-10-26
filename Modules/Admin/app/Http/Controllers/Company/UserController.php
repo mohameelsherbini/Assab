@@ -184,7 +184,7 @@ class UserController extends AsabController
     public function toggleStatus(Request $request, string $id): JsonResponse
     {
         return $this->run(function () use ($request, $id) {
-            $cu = CompanyUser::where('company_id', $request->user()->company_id)->findOrFail($id);
+            $cu = CompanyUser::where('company_id', $request->user()->company_id)->with('user')->findOrFail($id);
             if ($cu->user_id === $request->user()->id) {
                 throw new AsabException('CANNOT_DISABLE_SELF', 'Cannot disable yourself', 'لا يمكنك إيقاف حسابك', 409);
             }
@@ -193,8 +193,14 @@ class UserController extends AsabController
             }
             $new = $cu->status === 'active' ? 'inactive' : 'active';
             $cu->update(['status' => $new]);
+
             if ($new === 'inactive') {
+                $cu->user?->tokens()->delete();
+                $this->notifications->push($request->user()->id, 'user.suspended', 'تم إيقاف حساب المستخدم', $cu->user?->email ?? $cu->id);
                 $this->rt->userLifecycle($request->user()->company_id, 'suspended', $cu->fresh());
+            } else {
+                $this->notifications->push($request->user()->id, 'user.reactivated', 'تمت إعادة تفعيل حساب المستخدم', $cu->user?->email ?? $cu->id);
+                $this->rt->userLifecycle($request->user()->company_id, 'reactivated', $cu->fresh());
             }
 
             return $this->ok(['id' => $cu->id, 'status' => $new]);
@@ -204,11 +210,25 @@ class UserController extends AsabController
     public function destroy(Request $request, string $id): JsonResponse
     {
         return $this->run(function () use ($request, $id) {
-            $cu = CompanyUser::where('company_id', $request->user()->company_id)->findOrFail($id);
+            $cu = CompanyUser::where('company_id', $request->user()->company_id)->with('user')->findOrFail($id);
             if ($cu->role_key === 'company-admin' && $this->isLastAdmin($cu)) {
                 throw new AsabException('LAST_ACTIVE_ADMIN', 'Cannot remove the last admin', 'لا يمكن حذف آخر أدمن', 409);
             }
-            $cu->delete();
+
+            // MEM-01..06: Archive membership (soft retention with status='archived') instead of hard delete
+            $cu->update(['status' => 'archived']);
+
+            // Instantly revoke all active tokens/sessions
+            $cu->user?->tokens()->delete();
+
+            // Notify supervisor and broadcast lifecycle event
+            $this->notifications->push(
+                $request->user()->id,
+                'user.archived',
+                'تمت أرشفة عضوية المستخدم',
+                $cu->user?->email ?? $cu->id
+            );
+            $this->rt->userLifecycle($request->user()->company_id, 'archived', $cu->fresh());
 
             return $this->noContent();
         });

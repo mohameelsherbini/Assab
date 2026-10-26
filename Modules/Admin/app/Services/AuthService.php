@@ -98,6 +98,15 @@ class AuthService
             throw new AsabException('USER_INACTIVE', 'User account is not active', 'الحساب غير مُفعّل', 403);
         }
 
+        if ($user->company_id !== null) {
+            $cu = \Modules\Admin\Models\CompanyUser::where('user_id', $user->id)
+                ->where('company_id', $user->company_id)
+                ->first();
+            if ($cu && in_array($cu->status, ['inactive', 'archived'])) {
+                throw new AsabException('USER_INACTIVE', 'User membership is not active', 'عضوية المستخدم غير نشطة أو تمت أرشفتها', 403);
+            }
+        }
+
         if ($user->twoFactorEnabled()) {
             if ($code === null || $code === '') {
                 $token = Str::random(48);
@@ -243,6 +252,12 @@ class AuthService
                 $company = AsabCompany::where('id', $user->company_id)->first();
                 if (! $company || $company->status === 'suspended') {
                     throw new AsabException('USER_INACTIVE', 'Company is not active', 'الشركة غير نشطة', 403);
+                }
+                $cu = \Modules\Admin\Models\CompanyUser::where('user_id', $user->id)
+                    ->where('company_id', $user->company_id)
+                    ->first();
+                if ($cu && in_array($cu->status, ['inactive', 'archived'])) {
+                    throw new AsabException('USER_INACTIVE', 'User membership is not active', 'عضوية المستخدم غير نشطة أو تمت أرشفتها', 403);
                 }
             }
 

@@ -29,6 +29,15 @@ class EnsureAsabRole
             return $this->deny('USER_INACTIVE', 'User account is not active', 'الحساب غير مُفعّل', 403);
         }
 
+        if ($user->company_id !== null) {
+            $cu = \Modules\Admin\Models\CompanyUser::where('user_id', $user->id)
+                ->where('company_id', $user->company_id)
+                ->first();
+            if ($cu && in_array($cu->status, ['inactive', 'archived'])) {
+                return $this->deny('USER_INACTIVE', 'User membership is not active', 'عضوية المستخدم غير نشطة أو تمت أرشفتها', 403);
+            }
+        }
+
         return $next($request);
     }
 
