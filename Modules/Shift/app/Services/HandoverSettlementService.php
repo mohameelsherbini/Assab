@@ -15,6 +15,7 @@ use Modules\Shift\Models\CashierShift;
 use Modules\Shift\Models\CashierShiftHandover;
 use Modules\Shift\Models\CashierShiftHandoverReceipt;
 use Modules\Shift\Models\CashierShiftHistory;
+use Modules\Shift\Models\ShiftDebtRepayment;
 use Modules\Shift\Models\ShiftHandoverSettlement;
 use Modules\Shift\Policies\HandoverSettlementActorPolicy;
 use Symfony\Component\HttpKernel\Exception\AccessDeniedHttpException;
@@ -352,5 +353,108 @@ class HandoverSettlementService
         if (trim($operationId) === '' || strlen($operationId) > 100) {
             throw ValidationException::withMessages(['operation_id' => 'Operation ID is required and must not exceed 100 characters.']);
         }
+    }
+
+    /**
+     * CASH-16 / BE-16: Cashier submits debt repayment handover to branch manager.
+     * Debt liability is not reduced until the manager physically confirms the handover.
+     *
+     * @throws ValidationException|AccessDeniedHttpException
+     */
+    public function submitDebtRepayment(Cashier $cashier, string $managerId, int $amountHalalas, ?string $notes = null): ShiftDebtRepayment
+    {
+        if ($amountHalalas <= 0 || $amountHalalas > self::MAX_MONETARY_HALALAS) {
+            throw ValidationException::withMessages(['amountHalalas' => 'Repayment amount in halalas must be positive.']);
+        }
+
+        $manager = BranchManager::findOrFail($managerId);
+        if ((string) $manager->branch_id !== (string) $cashier->branch_id) {
+            throw new AccessDeniedHttpException('BRANCH_MANAGER_BRANCH_MISMATCH');
+        }
+
+        $branchId = (string) $cashier->branch_id;
+        $companyId = DB::table('branches')->where('id', $branchId)->value('asab_company_id');
+
+        return ShiftDebtRepayment::create([
+            'company_id' => $companyId ?? $branchId,
+            'branch_id' => $branchId,
+            'cashier_id' => (string) $cashier->id,
+            'manager_id' => (string) $manager->id,
+            'amount_halalas' => $amountHalalas,
+            'notes' => $notes,
+            'status' => 'pending_manager_confirmation',
+        ]);
+    }
+
+    /**
+     * CASH-16 / BE-16: Branch manager confirms debt repayment handover.
+     * Reduces cashier debt statement balance without reopening reports or creating phantom sales.
+     *
+     * @return array{repayment: ShiftDebtRepayment, amount_halalas: int, remaining_debt_halalas: int}
+     *
+     * @throws ConflictHttpException|AccessDeniedHttpException
+     */
+    public function confirmDebtRepayment(ShiftDebtRepayment $repayment, Model $actor): array
+    {
+        return DB::transaction(function () use ($repayment, $actor) {
+            $repayment = ShiftDebtRepayment::whereKey($repayment->id)->lockForUpdate()->firstOrFail();
+
+            if ($repayment->status !== 'pending_manager_confirmation') {
+                throw new ConflictHttpException('REPAYMENT_ALREADY_RESOLVED');
+            }
+
+            if (! ($actor instanceof BranchManager) || (string) $actor->id !== (string) $repayment->manager_id) {
+                throw new AccessDeniedHttpException('ONLY_ASSIGNED_MANAGER_MAY_CONFIRM_REPAYMENT');
+            }
+
+            $sarUnits = intdiv($repayment->amount_halalas, 100);
+            $sarFraction = abs($repayment->amount_halalas % 100);
+            $amountSar = sprintf('%d.%02d', $sarUnits, $sarFraction);
+
+            $cashier = Cashier::findOrFail($repayment->cashier_id);
+            $manager = BranchManager::findOrFail($repayment->manager_id);
+
+            // 1. Cashier custody row: Debt Repayment (Cash Out, reduces debt liability)
+            CashierCustodyTransaction::create([
+                'cashier_id' => $cashier->id,
+                'debt_repayment_id' => $repayment->id,
+                'transaction_type' => 'Debt Repayment',
+                'amount' => $amountSar,
+                'is_cash_in' => false,
+                'counterpart_name' => $manager->name,
+                'transaction_date' => now(),
+                'category' => 'debt_repayment',
+            ]);
+
+            // 2. Manager personal ledger row: Debt Repayment (Cash In, receiving physical cash)
+            PersonalLedgerTransaction::create([
+                'branch_manager_id' => $manager->id,
+                'debt_repayment_id' => $repayment->id,
+                'transaction_type' => 'Debt Repayment',
+                'amount' => $amountSar,
+                'is_cash_in' => true,
+                'cashier_name' => $cashier->name,
+                'transaction_date' => now(),
+                'category' => 'debt_repayment',
+            ]);
+
+            $repayment->update([
+                'status' => 'confirmed',
+                'confirmed_at' => now(),
+                'confirmed_by_id' => (string) $actor->id,
+            ]);
+
+            // Compute remaining cashier debt in halalas
+            $in = (float) CashierCustodyTransaction::where('cashier_id', $cashier->id)->where('is_cash_in', true)->sum('amount');
+            $out = (float) CashierCustodyTransaction::where('cashier_id', $cashier->id)->where('is_cash_in', false)->sum('amount');
+            $remainingDebtSar = max(0.0, round($in - $out, 2));
+            $remainingDebtHalalas = (int) round($remainingDebtSar * 100);
+
+            return [
+                'repayment' => $repayment,
+                'amount_halalas' => $repayment->amount_halalas,
+                'remaining_debt_halalas' => $remainingDebtHalalas,
+            ];
+        });
     }
 }

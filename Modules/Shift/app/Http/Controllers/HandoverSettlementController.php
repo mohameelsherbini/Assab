@@ -8,7 +8,9 @@ use Illuminate\Routing\Controller;
 use Illuminate\Support\Facades\Validator;
 use Illuminate\Support\Str;
 use Modules\Admin\Services\CommandIdempotencyContext;
+use Modules\Cashier\Models\Cashier;
 use Modules\Shift\Models\CashierShiftHandoverReceipt;
+use Modules\Shift\Models\ShiftDebtRepayment;
 use Modules\Shift\Models\ShiftHandoverSettlement;
 use Modules\Shift\Services\HandoverSettlementService;
 use Modules\Shift\Transformers\ShiftHandoverSettlementResource;
@@ -156,6 +158,97 @@ class HandoverSettlementController extends Controller
             ]);
         } catch (\Throwable $e) {
             return HandoverErrorResponse::from($e, 'index_settlements');
+        }
+    }
+
+    /**
+     * CASH-16 / BE-16: Cashier submits physical cash debt repayment to manager.
+     */
+    public function submitRepayment(Request $request): Response
+    {
+        try {
+            $actor = auth()->user();
+            if (! ($actor instanceof Cashier)) {
+                return HandoverErrorResponse::domain('ONLY_CASHIER_MAY_SUBMIT_REPAYMENT', 403);
+            }
+
+            $validator = Validator::make($request->all(), [
+                'amountHalalas' => 'required|integer|min:1',
+                'managerId' => 'required|uuid|exists:branch_managers,id',
+                'notes' => 'nullable|string|max:500',
+            ]);
+
+            if ($validator->fails()) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Validation failed',
+                    'code' => 'VALIDATION_ERROR',
+                    'errors' => $validator->errors(),
+                ], 422);
+            }
+
+            $repayment = $this->settlementService->submitDebtRepayment(
+                $actor,
+                (string) $request->input('managerId'),
+                (int) $request->input('amountHalalas'),
+                $request->input('notes')
+            );
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Debt repayment submitted successfully',
+                'repaymentId' => $repayment->id,
+                'status' => $repayment->status,
+                'data' => [
+                    'repaymentId' => $repayment->id,
+                    'repayment_id' => $repayment->id,
+                    'status' => $repayment->status,
+                    'amountHalalas' => $repayment->amount_halalas,
+                    'managerId' => $repayment->manager_id,
+                    'cashierId' => $repayment->cashier_id,
+                    'created_at' => $repayment->created_at,
+                ],
+            ], 201);
+        } catch (\Throwable $e) {
+            return HandoverErrorResponse::from($e, 'submitRepayment');
+        }
+    }
+
+    /**
+     * CASH-16 / BE-16: Branch manager confirms physical cash debt repayment.
+     */
+    public function confirmRepayment(Request $request, string $repaymentId): Response
+    {
+        try {
+            $actor = auth()->user();
+            if (! $actor) {
+                return HandoverErrorResponse::domain('UNAUTHORIZED_ACTOR', 403);
+            }
+
+            $repayment = ShiftDebtRepayment::findOrFail($repaymentId);
+
+            $result = $this->settlementService->confirmDebtRepayment($repayment, $actor);
+            $confirmedRepayment = $result['repayment'];
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Debt repayment confirmed successfully',
+                'repaymentId' => $confirmedRepayment->id,
+                'status' => 'confirmed',
+                'amountHalalas' => $result['amount_halalas'],
+                'remainingDebtHalalas' => $result['remaining_debt_halalas'],
+                'data' => [
+                    'repaymentId' => $confirmedRepayment->id,
+                    'repayment_id' => $confirmedRepayment->id,
+                    'status' => 'confirmed',
+                    'amountHalalas' => $result['amount_halalas'],
+                    'remainingDebtHalalas' => $result['remaining_debt_halalas'],
+                    'confirmed_by_id' => $confirmedRepayment->confirmed_by_id,
+                    'confirmed_at' => $confirmedRepayment->confirmed_at,
+                ],
+            ], 200);
+        } catch (\Throwable $e) {
+            return HandoverErrorResponse::from($e, 'confirmRepayment');
         }
     }
 }

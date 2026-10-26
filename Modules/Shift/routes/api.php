@@ -27,6 +27,12 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::post('shift-transfer-attempts/{attempt}/confirm-receipt', [$controller, 'receipt']);
     Route::post('shift-transfer-returns/{return}/confirm', [$controller, 'confirm']);
     Route::post('shift-reports/{shift}/recount', [$controller, 'recount']);
+
+    // CASH-16 / BE-16: Cashier debt repayment handover without shift reopening
+    Route::post('shifts/repayments', [\Modules\Shift\Http\Controllers\HandoverSettlementController::class, 'submitRepayment'])
+        ->name('shifts.repayments.submit');
+    Route::post('shifts/repayments/{repayment}/confirm', [\Modules\Shift\Http\Controllers\HandoverSettlementController::class, 'confirmRepayment'])
+        ->name('shifts.repayments.confirm');
 });
 
 /*
