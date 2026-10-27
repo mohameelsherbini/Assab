@@ -358,9 +358,11 @@ class EmployeeLedgerService
 
     /**
      * Canonical replay comparison for a reused settlement idempotency key: the
-     * employee is matched by the lookup itself; here the amount and reason must
-     * be identical before the existing request may be replayed. A `null` amount
-     * means "full outstanding balance", so only the reason is comparable.
+     * employee is matched by the lookup itself; here the reason and effective
+     * settlement amount must be identical before the existing request may be replayed.
+     * When $amount is null (meaning "full outstanding balance"), the requested
+     * amount is the employee's standing balance magnitude at replay time; it must
+     * strictly match the stored request amount to avoid replaying a partial settlement.
      */
     private function sameSettlementPayload(\Modules\Admin\Models\EmployeeSettlementRequest $existing, ?int $amount, string $reason): bool
     {
@@ -368,7 +370,9 @@ class EmployeeLedgerService
             return false;
         }
 
-        return $amount === null || (int) $existing->amount_halalas === (int) $amount;
+        $expectedAmount = $amount !== null ? (int) $amount : abs($this->currentBalance($existing->employee_id));
+
+        return $expectedAmount > 0 && (int) $existing->amount_halalas === $expectedAmount;
     }
 
     /**

@@ -170,6 +170,54 @@ class EmployeeSettlementStaleApprovalRegressionTest extends TestCase
         $this->assertSame(1, EmployeeSettlementRequest::where('idempotency_key', $key)->count());
     }
 
+    public function test_omitted_amount_replay_against_explicit_partial_settlement_returns_conflict(): void
+    {
+        // Outstanding balance: 5,000 halalas (created in setUp).
+        $key = (string) Str::uuid();
+
+        // Original request: explicit amount 1,000 halalas with key $key.
+        $res1 = $this->settleViaBody($this->employee, [
+            'idempotencyKey' => $key,
+            'amountHalalas' => 1000,
+            'reason' => 'تسوية جزئية',
+        ]);
+        $res1->assertStatus(201);
+        $this->assertSame(1000, $res1->json('amountHalalas'));
+
+        // Replay: same key $key, same reason, but amount omitted (meaning full outstanding balance 5000 halalas).
+        // Must reject changed semantic payload with 409 conflict, NOT return the 1000 halalas request!
+        $res2 = $this->settleViaBody($this->employee, [
+            'idempotencyKey' => $key,
+            'reason' => 'تسوية جزئية',
+        ]);
+        $res2->assertStatus(409);
+        $this->assertSame('IDEMPOTENCY_KEY_REUSED', $res2->json('error.code'));
+        $this->assertSame(1, EmployeeSettlementRequest::where('idempotency_key', $key)->count());
+    }
+
+    public function test_omitted_amount_replay_against_omitted_amount_replays_successfully(): void
+    {
+        $key = (string) Str::uuid();
+
+        // Original request: amount omitted (full balance = 5000 halalas).
+        $res1 = $this->settleViaBody($this->employee, [
+            'idempotencyKey' => $key,
+            'reason' => 'تسوية رصيد كامل',
+        ]);
+        $res1->assertStatus(201);
+        $this->assertSame(5000, $res1->json('amountHalalas'));
+
+        // Replay: same key, same reason, amount omitted.
+        $res2 = $this->settleViaBody($this->employee, [
+            'idempotencyKey' => $key,
+            'reason' => 'تسوية رصيد كامل',
+        ]);
+        $res2->assertStatus(201);
+        $this->assertSame($res1->json('id'), $res2->json('id'));
+        $this->assertSame(5000, $res2->json('amountHalalas'));
+        $this->assertSame(1, EmployeeSettlementRequest::where('idempotency_key', $key)->count());
+    }
+
     public function test_header_key_used_for_another_employee_does_not_leak_or_create(): void
     {
         $other = $this->createEmployee('2002', 'سعيد كاشير', -4000);
