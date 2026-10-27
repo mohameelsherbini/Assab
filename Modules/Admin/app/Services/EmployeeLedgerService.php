@@ -197,11 +197,34 @@ class EmployeeLedgerService
                 ->where('idempotency_key', $idempotencyKey)
                 ->first();
             if ($existing) {
+                // The replay identity is scoped to the employee (resource): a key
+                // bound to another employee must conflict, never leak that request.
+                if ((string) $existing->employee_id !== (string) $employee->id) {
+                    throw new AsabException(
+                        'IDEMPOTENCY_KEY_REUSED',
+                        'Idempotency-Key is already bound to another employee settlement',
+                        'مفتاح التكرار مرتبط بتسوية موظف آخر',
+                        409,
+                    );
+                }
+
+                if (! $this->sameSettlementPayload($existing, $amount, $trimmedReason)) {
+                    throw new AsabException(
+                        'IDEMPOTENCY_KEY_REUSED',
+                        'Idempotency-Key was reused with a different payload',
+                        'تمت إعادة استخدام مفتاح التكرار بحمولة مختلفة',
+                        409,
+                    );
+                }
+
                 return $this->formatSettlementResponse($existing, $this->currentBalance($employee->id));
             }
         }
 
         return DB::transaction(function () use ($employee, $amount, $actor, $trimmedReason, $idempotencyKey) {
+            // Serialize against settlements approval on the same financial source.
+            Employee::whereKey($employee->id)->lockForUpdate()->first();
+
             $balance = $this->currentBalance($employee->id);
             if ($balance === 0) {
                 throw new AsabException('BALANCE_ALREADY_SETTLED', 'Balance is already zero', 'الرصيد صفر بالفعل', 409);
@@ -241,21 +264,43 @@ class EmployeeLedgerService
     public function approveSettlement(string $id, AsabUser $reviewer): array
     {
         return DB::transaction(function () use ($id, $reviewer) {
+            // Lock order (employee → request) matches settleBalance creation so
+            // concurrent creation/approval for one employee never deadlocks.
             $req = \Modules\Admin\Models\EmployeeSettlementRequest::where('company_id', $reviewer->company_id)
-                ->lockForUpdate()
                 ->findOrFail($id);
+            $employee = Employee::whereKey($req->employee_id)->lockForUpdate()->firstOrFail();
+            $req = \Modules\Admin\Models\EmployeeSettlementRequest::whereKey($req->id)
+                ->lockForUpdate()
+                ->first();
 
-            if ($req->status !== 'pending') {
-                throw new AsabException('REQUEST_ALREADY_PROCESSED', 'Settlement request is already '.$req->status, 'تمت معالجة طلب التسوية مسبقاً', 409);
+            if ($req === null || $req->status !== 'pending') {
+                throw new AsabException('REQUEST_ALREADY_PROCESSED', 'Settlement request is already '.($req->status ?? 'processed'), 'تمت معالجة طلب التسوية مسبقاً', 409);
             }
 
-            $employee = Employee::findOrFail($req->employee_id);
-            $balance = $this->currentBalance($employee->id);
+            $balance = $this->currentBalance($req->employee_id);
+            $amount = (int) $req->amount_halalas;
+
+            // Stale revalidation: the request may only post while the outstanding
+            // balance still covers its amount in the direction it was created for.
+            if ($balance === 0) {
+                throw new AsabException('BALANCE_ALREADY_SETTLED', 'Employee balance is already zero; this settlement request is stale and must be resubmitted', 'الرصيد صفر بالفعل — طلب التسوية قديم ويجب إعادة إنشائه', 409);
+            }
+
+            if (abs($balance) < $amount) {
+                throw new AsabException('SETTLEMENT_BALANCE_CHANGED', 'The outstanding balance no longer covers this settlement request; it is stale and must be resubmitted', 'الرصيد القائم لم يعد يغطي طلب التسوية — الطلب قديم ويجب إعادة إنشائه', 409);
+            }
+
+            $creationBalance = $this->balanceAt($req->employee_id, $req->created_at);
+            if ($creationBalance !== 0 && ($balance < 0) !== ($creationBalance < 0)) {
+                throw new AsabException('SETTLEMENT_DIRECTION_CHANGED', 'The balance direction changed since this request was created; it is stale and must be resubmitted', 'اتجاه الرصيد تغيّر بعد إنشاء الطلب — الطلب قديم ويجب إعادة إنشائه', 409);
+            }
 
             // Debtor (negative) → credit clears it; creditor (positive) → debit.
+            // The revalidation above guarantees the posting moves toward zero and
+            // never recreates debt in either direction.
             $type = $balance < 0 ? 'credit' : 'debit';
             $movement = EmployeeMovement::create([
-                'employee_id' => $employee->id,
+                'employee_id' => $req->employee_id,
                 'movement_type' => $type,
                 'amount' => $req->amount_halalas,
                 'category' => 'settlement',
@@ -272,7 +317,7 @@ class EmployeeLedgerService
                 'movement_id' => $movement->id,
             ]);
 
-            $newBalance = $this->currentBalance($employee->id);
+            $newBalance = $this->currentBalance($req->employee_id);
 
             $res = $this->formatSettlementResponse($req, $newBalance);
             $res['movementType'] = $type;
@@ -309,6 +354,35 @@ class EmployeeLedgerService
 
             return $this->formatSettlementResponse($req);
         });
+    }
+
+    /**
+     * Canonical replay comparison for a reused settlement idempotency key: the
+     * employee is matched by the lookup itself; here the amount and reason must
+     * be identical before the existing request may be replayed. A `null` amount
+     * means "full outstanding balance", so only the reason is comparable.
+     */
+    private function sameSettlementPayload(\Modules\Admin\Models\EmployeeSettlementRequest $existing, ?int $amount, string $reason): bool
+    {
+        if (trim($existing->reason ?? '') !== $reason) {
+            return false;
+        }
+
+        return $amount === null || (int) $existing->amount_halalas === (int) $amount;
+    }
+
+    /**
+     * Signed balance restricted to movements recorded no later than $until.
+     * Recovers a settlement request's creation-time direction from the ledger
+     * itself, since the schema stores no direction column (BE-09 migration
+     * is unapproved; a stored direction/balance column belongs to its review).
+     */
+    private function balanceAt(string $employeeId, $until): int
+    {
+        return (int) EmployeeMovement::where('employee_id', $employeeId)
+            ->where('created_at', '<=', $until)
+            ->selectRaw("COALESCE(SUM(CASE WHEN movement_type = 'credit' THEN amount ELSE -amount END), 0) as bal")
+            ->value('bal');
     }
 
     public function formatSettlementResponse(\Modules\Admin\Models\EmployeeSettlementRequest $req, ?int $balance = null): array
