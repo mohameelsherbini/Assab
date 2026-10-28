@@ -2,15 +2,40 @@
 
 namespace Tests\Feature;
 
-// Worker entry: runs in an independent PHP process / PDO connection against the same disposable MariaDB schema.
+// Worker entry: runs in an independent PDO connection against the same disposable MariaDB or MySQL schema.
 if (PHP_SAPI === 'cli' && ($argv[1] ?? '') === '--pkg67-worker') {
     require dirname(__DIR__, 2).'/vendor/autoload.php';
     $app = require dirname(__DIR__, 2).'/bootstrap/app.php';
     $app->make(\Illuminate\Contracts\Console\Kernel::class)->bootstrap();
     $db = \Illuminate\Support\Facades\DB::connection();
-    if ($db->getDriverName() !== 'mysql' || ! preg_match('/\Apkg67_disposable_[a-z0-9_]+\z/', $db->getDatabaseName())
-        || ! in_array($db->getConfig('host'), ['localhost', '127.0.0.1'], true)) {
-        throw new \LogicException('Worker refuses any shared/non-disposable database.');
+    $mysqlMode = getenv('PKG67_MYSQL_TESTS') === '1';
+    $database = $db->getDatabaseName();
+    $host = $db->getConfig('host');
+    if ($db->getDriverName() !== 'mysql' || ! in_array($host, ['localhost', '127.0.0.1'], true)) {
+        throw new \LogicException('Worker refuses non-MySQL-driver or non-loopback database connections.');
+    }
+    if ($mysqlMode) {
+        $expectedSchema = getenv('PKG67_MYSQL_DISPOSABLE_SCHEMA') ?: '';
+        $expectedVersion = getenv('PKG67_EXPECTED_MYSQL_VERSION') ?: '';
+        if (! preg_match('/\Apkg67_mysql_disposable_[a-z0-9_]+\z/', $database)
+            || $expectedSchema !== $database || $expectedVersion === '' || app()->environment() !== 'testing') {
+            throw new \LogicException('MySQL worker refuses any unconfirmed/non-disposable schema.');
+        }
+        $identity = $db->selectOne('SELECT VERSION() AS version, @@version_comment AS version_comment');
+        if ($identity->version !== $expectedVersion || ! str_contains(strtolower($identity->version_comment), 'mysql')
+            || str_contains(strtolower($identity->version_comment), 'mariadb')) {
+            throw new \LogicException('MySQL worker server identity/version differs from the verified expected MySQL release.');
+        }
+        $isolation = $db->selectOne('SELECT @@transaction_isolation AS isolation')->isolation;
+        if (strtoupper(str_replace('_', '-', $isolation)) !== 'REPEATABLE-READ') {
+            throw new \LogicException('MySQL worker requires REPEATABLE READ for stale-snapshot scenarios.');
+        }
+        $engines = $db->select("SELECT ENGINE AS engine FROM information_schema.tables WHERE TABLE_SCHEMA = DATABASE() AND TABLE_TYPE = 'BASE TABLE'");
+        if ($engines === [] || array_filter($engines, fn ($table) => $table->engine !== 'InnoDB') !== []) {
+            throw new \LogicException('MySQL worker requires all disposable schema tables to use InnoDB.');
+        }
+    } elseif (! preg_match('/\Apkg67_disposable_[a-z0-9_]+\z/', $database)) {
+        throw new \LogicException('Worker refuses any shared/non-disposable MariaDB schema.');
     }
     $in = json_decode($argv[2], true, 512, JSON_THROW_ON_ERROR);
     $touch = fn (string $suffix) => file_put_contents($in['barrier'].'.'.$suffix, (string) microtime(true));
@@ -199,8 +224,9 @@ use Symfony\Component\Process\Process;
 use Tests\TestCase;
 
 /**
- * Opt-in (PKG67_MARIADB_TESTS=1) disposable-MariaDB gate for the composed PKG-2/3/6/7 source.
- * Independent PHP processes = independent InnoDB connections. SQLite must yield NOT_RUN, never PASS.
+ * Opt-in MariaDB composition gate for the composed PKG-2/3/6/7 source.
+ * The separate MySQL/InnoDB run inherits these exact 22 scenarios in tests/Integration.
+ * SQLite must yield NOT_RUN, never PASS.
  */
 class Pkg67MariaDbCompositionTest extends TestCase
 {
@@ -212,18 +238,57 @@ class Pkg67MariaDbCompositionTest extends TestCase
 
     protected function setUp(): void
     {
+        $this->setUpCompositionDatabase('mariadb');
+    }
+
+    /** Shared setup that keeps the historical MariaDB run separate from the new Oracle MySQL proof. */
+    protected function setUpCompositionDatabase(string $engine): void
+    {
         parent::setUp();
-        if (env('PKG67_MARIADB_TESTS') !== '1' || DB::connection()->getDriverName() !== 'mysql') {
-            $this->markTestSkipped('NOT_RUN: isolated MariaDB unavailable. SQLite cannot establish financial lock safety.');
+        $database = DB::connection()->getDatabaseName();
+        $host = DB::connection()->getConfig('host');
+        if ($engine === 'mariadb') {
+            if (env('PKG67_MARIADB_TESTS') !== '1' || DB::connection()->getDriverName() !== 'mysql') {
+                $this->markTestSkipped('NOT_RUN: isolated MariaDB unavailable. SQLite cannot establish financial lock safety.');
+            }
+            if (! preg_match('/\Apkg67_disposable_[a-z0-9_]+\z/', $database)
+                || ! in_array($host, ['localhost', '127.0.0.1'], true)) {
+                throw new \LogicException('Refusing non-disposable MariaDB schema');
+            }
+            $this->assertStringContainsString('MariaDB', DB::selectOne('SELECT VERSION() AS v')->v);
+        } elseif ($engine === 'mysql') {
+            if (env('PKG67_MYSQL_TESTS') !== '1' || DB::connection()->getDriverName() !== 'mysql') {
+                $this->markTestSkipped('NOT_RUN: dedicated Oracle MySQL/InnoDB integration gate is not enabled.');
+            }
+            $expectedSchema = (string) env('PKG67_MYSQL_DISPOSABLE_SCHEMA', '');
+            $expectedVersion = (string) env('PKG67_EXPECTED_MYSQL_VERSION', '');
+            if (! preg_match('/\Apkg67_mysql_disposable_[a-z0-9_]+\z/', $database)
+                || $expectedSchema !== $database || $expectedVersion === ''
+                || ! in_array($host, ['localhost', '127.0.0.1'], true)
+                || ! app()->environment('testing')) {
+                throw new \LogicException('Refusing unconfirmed/non-disposable MySQL schema or non-test application environment.');
+            }
+            $identity = DB::selectOne('SELECT VERSION() AS version, @@version_comment AS version_comment');
+            $this->assertSame($expectedVersion, $identity->version, 'Server version must match the Oracle MySQL identity captured by this run preflight.');
+            $this->assertStringContainsString('mysql', strtolower($identity->version_comment));
+            $this->assertStringNotContainsString('mariadb', strtolower($identity->version_comment));
+            $isolation = DB::selectOne('SELECT @@transaction_isolation AS isolation')->isolation;
+            $this->assertSame('REPEATABLE-READ', strtoupper(str_replace('_', '-', $isolation)),
+                'Stale-snapshot scenarios require MySQL InnoDB REPEATABLE READ semantics.');
+        } else {
+            throw new \LogicException('Unsupported PKG-67 composition engine.');
         }
-        if (! preg_match('/\Apkg67_disposable_[a-z0-9_]+\z/', DB::connection()->getDatabaseName())
-            || ! in_array(DB::connection()->getConfig('host'), ['localhost', '127.0.0.1'], true)) {
-            throw new \LogicException('Refusing non-disposable MariaDB schema');
-        }
-        $this->assertStringContainsString('MariaDB', DB::selectOne('SELECT VERSION() AS v')->v);
+
         if (! self::$migrated) {
             $this->artisan('migrate:fresh', ['--force' => true])->assertExitCode(0);
             self::$migrated = true;
+        }
+        if ($engine === 'mysql') {
+            $tables = DB::select("SELECT TABLE_NAME AS table_name, ENGINE AS engine FROM information_schema.tables WHERE TABLE_SCHEMA = DATABASE() AND TABLE_TYPE = 'BASE TABLE'");
+            $this->assertNotEmpty($tables, 'migrate:fresh must create the disposable schema tables before scenarios start.');
+            foreach ($tables as $table) {
+                $this->assertSame('InnoDB', $table->engine, "{$table->table_name} must use InnoDB.");
+            }
         }
         $this->assertSame(0, DB::transactionLevel(), 'Workers must see committed fixtures.');
     }
@@ -318,7 +383,12 @@ class Pkg67MariaDbCompositionTest extends TestCase
         $environment = ['APP_ENV' => 'testing', 'DB_CONNECTION' => 'mysql', 'DB_HOST' => $config['host'],
             'DB_PORT' => (string) ($config['port'] ?? 3306), 'DB_DATABASE' => $config['database'],
             'DB_USERNAME' => $config['username'], 'DB_PASSWORD' => $config['password'] ?? '',
-            'CACHE_STORE' => 'array', 'QUEUE_CONNECTION' => 'sync', 'SESSION_DRIVER' => 'array'];
+            'DB_URL' => '', 'DATABASE_URL' => '', 'DB_SOCKET' => '',
+            'CACHE_STORE' => 'array', 'QUEUE_CONNECTION' => 'sync', 'SESSION_DRIVER' => 'array',
+            'PKG67_MYSQL_TESTS' => (string) env('PKG67_MYSQL_TESTS', ''),
+            'PKG67_MYSQL_DISPOSABLE_SCHEMA' => (string) env('PKG67_MYSQL_DISPOSABLE_SCHEMA', ''),
+            'PKG67_EXPECTED_MYSQL_VERSION' => (string) env('PKG67_EXPECTED_MYSQL_VERSION', ''),
+            'PKG67_MARIADB_TESTS' => (string) env('PKG67_MARIADB_TESTS', '')];
         $process = new Process([PHP_BINARY, '-c', php_ini_loaded_file() ?: '/dev/null', __FILE__, '--pkg67-worker', json_encode($input)], base_path(), $environment);
         $process->setTimeout(60);
         $process->start();

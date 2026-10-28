@@ -1,0 +1,123 @@
+name: ASSAB Closure Track B / Oracle MySQL proof
+
+# Deliberately branch-scoped. No staging/production endpoint, repository secret,
+# deployment, or flag operation is available to this workflow.
+on:
+  push:
+    branches:
+      - task/closure-track-b-mysql-proof
+    paths:
+      - .github/workflows/assab-closure-track-b-mysql-proof.yml
+      - scripts/harness/run_closure_mysql84.sh
+      - tests/Feature/Pkg67MariaDbCompositionTest.php
+      - tests/Feature/Pkg67MigrationB01Test.php
+      - tests/Feature/AdminLegacyRefreshConcurrencyTest.php
+      - tests/Feature/AdminSessionRevocationTest.php
+      - tests/Feature/Pkg6ReviewMySqlConcurrencyTest.php
+      - tests/Feature/ShiftNotWorkedMySqlConcurrencyTest.php
+      - tests/Feature/ShiftPhases234MySqlConcurrencyTest.php
+      - tests/Feature/ShiftPhases567MySqlConcurrencyTest.php
+      - tests/Feature/ShiftPhases8910MySqlConcurrencyTest.php
+      - tests/Integration/Pkg67MySqlInnoDbCompositionTest.php
+
+permissions:
+  contents: read
+
+concurrency:
+  group: assab-closure-track-b-mysql-proof-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  mysql84-closure-proof:
+    name: Closure v3.5 / Oracle MySQL 8.4 preliminary / PHP 8.3
+    runs-on: ubuntu-24.04
+    timeout-minutes: 140
+    env:
+      APP_ENV: testing
+      APP_DEBUG: 'false'
+      APP_KEY: base64:MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=
+      APP_URL: http://127.0.0.1
+      CACHE_STORE: array
+      SESSION_DRIVER: array
+      QUEUE_CONNECTION: sync
+      MAIL_MAILER: array
+      COMPOSER_NO_INTERACTION: '1'
+      DB_CONNECTION: mysql
+      DB_HOST: 127.0.0.1
+      DB_PORT: '3306'
+      DB_URL: ''
+      DATABASE_URL: ''
+      DB_SOCKET: ''
+      TESTED_HEAD: ${{ github.sha }}
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ALLOW_EMPTY_PASSWORD: 'yes'
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h localhost --silent"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=30
+    steps:
+      - name: Checkout exact tested SHA
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ env.TESTED_HEAD }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Preserve accepted candidate ancestry and source guards
+        env:
+          ANCHOR_SHA: dabae358560bacf00137ed5c21d31320669363f6
+          ANCHOR_TREE: c27728124844f40455a0ccf2c60741761160046e
+          BASELINE_SHA: 57bd40c3d55393db2cc113328e221d5d3a85caa0
+          ARTIFACT_DIR: artifacts/closure-track-b-mysql84/source-guard
+        run: bash scripts/ci/source_guard.sh
+
+      - name: Setup pinned PHP 8.3
+        uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # 2.37.2
+        with:
+          php-version: '8.3'
+          extensions: bcmath, curl, dom, fileinfo, gd, intl, mbstring, pdo_mysql, tokenizer, xml, zip
+          coverage: none
+          tools: composer:v2
+        env:
+          fail-fast: 'true'
+
+      - name: Validate locked dependencies and install
+        run: |
+          set -euo pipefail
+          php -r 'if (!str_starts_with(PHP_VERSION, "8.3.")) { throw new RuntimeException(PHP_VERSION); }'
+          composer validate --no-check-publish --no-interaction
+          composer install --no-interaction --prefer-dist --no-progress
+
+      - name: Run isolated 22 + 46 + 5 MySQL proof cases
+        run: bash scripts/harness/run_closure_mysql84.sh artifacts/closure-track-b-mysql84
+
+      - name: Publish proof classification
+        if: always()
+        run: |
+          {
+            echo '## Closure Track B MySQL proof'
+            echo '- Classification: preliminary only until exact production version identity is independently confirmed.'
+            echo '- No MariaDB result is included as MySQL evidence.'
+            if grep -q '^CLOSURE_MYSQL_PRECHECK=PASS$' artifacts/closure-track-b-mysql84/run-status.txt 2>/dev/null; then
+              echo '- Engine preflight: Oracle MySQL 8.4 identity and default InnoDB were verified from the live service.'
+              cat artifacts/closure-track-b-mysql84/mysql-runtime.txt 2>/dev/null || true
+            else
+              echo '- Engine preflight: NOT VERIFIED; no test result is MySQL proof.'
+            fi
+            cat artifacts/closure-track-b-mysql84/run-status.txt 2>/dev/null || true
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload MySQL evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: assab-closure-track-b-mysql84-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/closure-track-b-mysql84/
+          if-no-files-found: warn
+          retention-days: 30

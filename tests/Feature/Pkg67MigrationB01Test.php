@@ -9,7 +9,7 @@ use Illuminate\Support\Str;
 use Tests\TestCase;
 
 /**
- * B-01 — the PKG-2 delegation-audit migration on a REAL MySQL-family server (opt-in, disposable DB only).
+ * B-01 — the PKG-2 delegation-audit migration on a real MySQL-family server (opt-in, disposable DB only).
  * No schema shim: every scenario runs the actual migration files through `migrate` / `migrate:fresh`.
  */
 class Pkg67MigrationB01Test extends TestCase
@@ -23,14 +23,38 @@ class Pkg67MigrationB01Test extends TestCase
     protected function setUp(): void
     {
         parent::setUp();
-        if (env('PKG67_MARIADB_TESTS') !== '1' || DB::connection()->getDriverName() !== 'mysql') {
-            $this->markTestSkipped('NOT_RUN: opt-in MariaDB/MySQL gate (PKG67_MARIADB_TESTS=1).');
+        $mysqlMode = env('PKG67_MYSQL_TESTS') === '1';
+        $mariaDbMode = env('PKG67_MARIADB_TESTS') === '1';
+        if ((! $mysqlMode && ! $mariaDbMode) || DB::connection()->getDriverName() !== 'mysql') {
+            $this->markTestSkipped('NOT_RUN: explicit disposable MySQL or MariaDB migration gate is not enabled.');
         }
-        if (! preg_match('/\Apkg67_disposable_[a-z0-9_]+\z/', DB::connection()->getDatabaseName())
-            || ! in_array(DB::connection()->getConfig('host'), ['localhost', '127.0.0.1'], true)) {
-            throw new \LogicException('Refusing non-disposable schema');
+        $database = DB::connection()->getDatabaseName();
+        $host = DB::connection()->getConfig('host');
+        if ($mysqlMode) {
+            $expectedSchema = (string) env('PKG67_MYSQL_DISPOSABLE_SCHEMA', '');
+            $expectedVersion = (string) env('PKG67_EXPECTED_MYSQL_VERSION', '');
+            if (! preg_match('/\Apkg67_mysql_disposable_[a-z0-9_]+\z/', $database)
+                || $expectedSchema !== $database || $expectedVersion === ''
+                || ! in_array($host, ['localhost', '127.0.0.1'], true)
+                || ! app()->environment('testing')) {
+                throw new \LogicException('Refusing unconfirmed/non-disposable MySQL migration schema.');
+            }
+            $identity = DB::selectOne('SELECT VERSION() AS version, @@version_comment AS version_comment');
+            $this->assertSame($expectedVersion, $identity->version, 'Server version must match the Oracle MySQL identity captured by this run preflight.');
+            $this->assertStringContainsString('mysql', strtolower($identity->version_comment));
+            $this->assertStringNotContainsString('mariadb', strtolower($identity->version_comment));
+        } elseif (! preg_match('/\Apkg67_disposable_[a-z0-9_]+\z/', $database)
+            || ! in_array($host, ['localhost', '127.0.0.1'], true)) {
+            throw new \LogicException('Refusing non-disposable MariaDB schema');
         }
         $this->assertSame(0, Artisan::call('migrate:fresh', ['--force' => true]), Artisan::output());
+        if ($mysqlMode) {
+            $tables = DB::select("SELECT TABLE_NAME AS table_name, ENGINE AS engine FROM information_schema.tables WHERE TABLE_SCHEMA = DATABASE() AND TABLE_TYPE = 'BASE TABLE'");
+            $this->assertNotEmpty($tables, 'migrate:fresh must create the disposable schema tables.');
+            foreach ($tables as $table) {
+                $this->assertSame('InnoDB', $table->engine, "{$table->table_name} must use InnoDB.");
+            }
+        }
     }
 
     /** Re-open the audit migrations as "pending" on top of a fully migrated schema, with a hand-built table. */
