@@ -10,6 +10,7 @@ use Modules\Admin\Models\AsabBrand;
 use Modules\Admin\Models\AsabCompany;
 use Modules\Admin\Models\AsabUser;
 use Modules\Admin\Models\AsabUserRole;
+use Modules\Admin\Models\CompanyUser;
 use Modules\Branch\Models\Branch;
 use Modules\BranchManagers\Models\BranchManager;
 use Modules\Cashier\Models\Cashier;
@@ -587,7 +588,8 @@ class ShiftPhases567MySqlConcurrencyTest extends TestCase
         $payload = ['expected_revision' => 1, 'reason' => 'Public correction retry audit',
             'changes' => ['card_payments' => '10.00'],
             'shortage_allocations' => [['type' => 'cashier', 'id' => $cashier->id, 'amount' => 1000]]];
-        $first = $this->actingAs($accountant, 'sanctum')->withHeader('Idempotency-Key', $key)->postJson($url, $payload)->assertOk();
+        $first = $this->actingAs($accountant, 'sanctum')->withHeader('Idempotency-Key', $key)->postJson($url, $payload);
+        $this->assertSame(200, $first->getStatusCode(), 'First POST error.code: '.($first->json('error.code') ?? '<missing>'));
         $this->assertSame(2, $snapshots->attempts);
         $retry = $this->postJson($url, $payload)->assertOk();
         $this->assertSame($first->getContent(), $retry->getContent());
@@ -922,6 +924,12 @@ class ShiftPhases567MySqlConcurrencyTest extends TestCase
             'role_key' => 'accountant',
             'status' => 'active',
             'is_active' => true,
+        ]);
+        CompanyUser::create([
+            'company_id' => $company->id,
+            'user_id' => $accountant->id,
+            'role_key' => 'accountant',
+            'status' => 'active',
         ]);
         AsabUserRole::create([
             'user_id' => $accountant->id,

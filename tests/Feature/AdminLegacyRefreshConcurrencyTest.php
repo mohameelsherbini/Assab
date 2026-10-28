@@ -182,7 +182,9 @@ $wait = function ($suffix) use ($dir, $name) {
 $db = Illuminate\Support\Facades\DB::connection();
 $db->statement('SET SESSION innodb_lock_wait_timeout = 15');
 $connection = (int) $db->selectOne('SELECT CONNECTION_ID() AS id')->id;
-$isolation = $db->selectOne('SELECT @@tx_isolation AS level')->level;
+$serverVersion = (string) $db->selectOne('SELECT VERSION() AS version')->version;
+$isolationVariable = stripos($serverVersion, 'mariadb') === false ? 'transaction_isolation' : 'tx_isolation';
+$isolation = $db->selectOne('SELECT @@'.$isolationVariable.' AS level')->level;
 $signal('connection', (string) $connection);
 $auth = app(Modules\Admin\Services\AuthService::class);
 $user = $action === 'refresh' ? null : Modules\Admin\Models\AsabUser::findOrFail(getenv('S12_USER'));
