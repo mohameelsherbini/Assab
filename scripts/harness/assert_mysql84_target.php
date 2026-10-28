@@ -66,7 +66,7 @@ try {
         $connection = Illuminate\Support\Facades\DB::connection();
         $check('live Laravel driver is mysql', $connection->getDriverName() === 'mysql', 'driver='.$connection->getDriverName());
         $check('live PDO driver is mysql', $connection->getPdo()->getAttribute(PDO::ATTR_DRIVER_NAME) === 'mysql');
-        $actualDatabase = (string) ($connection->selectOne('SELECT DATABASE() AS database')->database ?? '');
+        $actualDatabase = (string) ($connection->selectOne('SELECT DATABASE() AS db_name')->db_name ?? '');
         $check('live database is the exact disposable target', $actualDatabase === $expectedDatabase,
             'database='.($actualDatabase === $expectedDatabase ? $actualDatabase : '[redacted]'));
         $version = (string) ($connection->selectOne('SELECT VERSION() AS version')->version ?? '');

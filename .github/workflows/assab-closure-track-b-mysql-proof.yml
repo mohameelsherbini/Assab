@@ -9,6 +9,7 @@ on:
     paths:
       - .github/workflows/assab-closure-track-b-mysql-proof.yml
       - scripts/harness/run_closure_mysql84.sh
+      - scripts/harness/assert_mysql84_target.php
       - tests/Feature/Pkg67MariaDbCompositionTest.php
       - tests/Feature/Pkg67MigrationB01Test.php
       - tests/Feature/AdminLegacyRefreshConcurrencyTest.php
