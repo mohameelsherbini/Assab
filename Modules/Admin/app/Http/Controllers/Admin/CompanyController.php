@@ -13,7 +13,9 @@ use Modules\Admin\Http\Controllers\AsabController;
 use Modules\Admin\Models\AsabBrand;
 use Modules\Admin\Models\AsabCompany;
 use Modules\Admin\Models\AsabRestaurant;
+use Modules\Admin\Models\AsabSubscription;
 use Modules\Admin\Models\AsabUser;
+use Modules\Admin\Models\CompanySubscription;
 use Modules\Admin\Models\Plan;
 use Modules\Admin\Notifications\SubscriptionReminderNotification;
 use Modules\Admin\Notifications\UserPasswordResetNotification;
@@ -85,9 +87,9 @@ class CompanyController extends AsabController
 
             [$company, $adminUser] = DB::transaction(function () use ($data, $provisioning, $adminEmail, $billingCycle) {
                 $catalogPlan = Plan::where('code', strtolower($data['plan']))->first();
-                if (! $catalogPlan) {
+                if (! $catalogPlan || $catalogPlan->status !== 'active') {
                     throw ValidationException::withMessages([
-                        'plan' => ["Plan '{$data['plan']}' does not exist in catalog."],
+                        'plan' => ["Plan '{$data['plan']}' does not exist or is inactive in catalog."],
                     ]);
                 }
 
@@ -144,6 +146,10 @@ class CompanyController extends AsabController
             ]);
 
             DB::transaction(function () use ($company, $data) {
+                if (isset($data['plan'])) {
+                    $this->syncSubscriptionsOnPlanChange($company, $data['plan']);
+                }
+
                 $company->fill(array_filter([
                     'name' => $data['name'] ?? null,
                     'contact_name' => $data['contactName'] ?? null,
@@ -154,6 +160,10 @@ class CompanyController extends AsabController
                 ], fn ($v) => $v !== null));
                 if (isset($data['modules'])) {
                     $company->modules = $data['modules'];
+                }
+                if (isset($data['plan'])) {
+                    $company->max_branches = $this->planLimit($data['plan'], 'branches');
+                    $company->max_users = $this->planLimit($data['plan'], 'users');
                 }
                 $company->save();
             });
@@ -204,11 +214,16 @@ class CompanyController extends AsabController
         return $this->run(function () use ($request, $id) {
             $data = $request->validate(['plan' => 'required|in:Basic,Professional,Enterprise']);
             $company = AsabCompany::findOrFail($id);
-            $company->update([
-                'plan' => $data['plan'],
-                'max_branches' => $this->planLimit($data['plan'], 'branches'),
-                'max_users' => $this->planLimit($data['plan'], 'users'),
-            ]);
+
+            DB::transaction(function () use ($company, $data) {
+                $this->syncSubscriptionsOnPlanChange($company, $data['plan']);
+
+                $company->update([
+                    'plan' => $data['plan'],
+                    'max_branches' => $this->planLimit($data['plan'], 'branches'),
+                    'max_users' => $this->planLimit($data['plan'], 'users'),
+                ]);
+            });
 
             return $this->ok($this->present($company->fresh()));
         });
@@ -403,6 +418,51 @@ class CompanyController extends AsabController
             return \Modules\Branch\Models\Branch::where('asab_company_id', $companyId)->count();
         } catch (\Throwable $e) {
             return 0;
+        }
+    }
+
+    private function syncSubscriptionsOnPlanChange(AsabCompany $company, string $planLabel): void
+    {
+        $plan = Plan::where(function ($q) use ($planLabel) {
+            $q->where('code', strtolower($planLabel))
+                ->orWhere('name_ar', $planLabel)
+                ->orWhere('name_en', $planLabel);
+        })->first();
+
+        if (! $plan || $plan->status !== 'active') {
+            throw ValidationException::withMessages([
+                'plan' => ["Plan '{$planLabel}' does not exist or is inactive in catalog."],
+            ]);
+        }
+
+        $sub = CompanySubscription::withoutGlobalScopes()->where('company_id', $company->id)->first();
+
+        // If authoritative subscription is absent, fail-closed. Do NOT guess or fabricate from incomplete legacy data.
+        if (! $sub) {
+            throw ValidationException::withMessages([
+                'plan' => ['Company has no authoritative subscription record to modify.'],
+            ]);
+        }
+
+        // 1. Authoritative store: update plan_id only, strictly preserving all lifecycle fields
+        $sub->update([
+            'plan_id' => $plan->id,
+        ]);
+
+        // 2. Legacy projection: update plan and price only if projection exists, strictly preserving all lifecycle fields
+        $asabSub = AsabSubscription::withoutGlobalScopes()->where('company_id', $company->id)->first();
+        if ($asabSub) {
+            $asabSub->update([
+                'plan' => $plan->name_ar ?? $planLabel,
+                'monthly_price' => $plan->price_monthly ?? 0,
+            ]);
+        }
+
+        // 3. Realtime notification (best-effort)
+        try {
+            app(\Modules\Admin\Services\RealtimeBroadcaster::class)->subscriptionUpdated($sub->fresh('plan'));
+        } catch (\Throwable $e) {
+            // Non-blocking
         }
     }
 

@@ -333,4 +333,272 @@ class AuthoritativeSubscriptionSourceTest extends TestCase
         $this->assertSame($this->proPlan->id, $sub->fresh()->plan_id);
         $this->assertSame($this->proPlan->name_ar, $asabSub->fresh()->plan);
     }
+
+    public function test_platform_admin_subscription_modification_is_reflected_in_company_api_and_legacy_projection(): void
+    {
+        // 1. Provision company with Basic plan via Platform Admin
+        $createRes = $this->actingAs($this->platformAdmin, 'sanctum')->postJson('/api/v1/admin/companies', [
+            'name' => 'Admin Upgrade Gourmet Co',
+            'plan' => 'Basic',
+            'billingCycle' => 'monthly',
+            'contactEmail' => 'owner@admin-upgrade.test',
+            'contactName' => 'Owner Gourmet',
+        ]);
+        $createRes->assertCreated();
+        $companyId = $createRes->json('id');
+        $this->assertNotNull($companyId);
+
+        $adminUser = AsabUser::where('email', 'owner@admin-upgrade.test')->firstOrFail();
+
+        // Verify initial state from Company API
+        $subRes1 = $this->actingAs($adminUser, 'sanctum')->getJson('/api/v1/company/me/subscription');
+        $subRes1->assertOk();
+        $this->assertSame('basic', $subRes1->json('plan.code'));
+        $this->assertSame('active', $subRes1->json('subscription.status'));
+
+        // Verify legacy projection exists
+        $legacySub = AsabSubscription::where('company_id', $companyId)->first();
+        $this->assertNotNull($legacySub);
+        $this->assertSame('باقة أساسية', $legacySub->plan);
+
+        // 2. Platform Admin upgrades the company to Professional
+        $upgradeRes = $this->actingAs($this->platformAdmin, 'sanctum')
+            ->postJson("/api/v1/admin/companies/{$companyId}/upgrade", [
+                'plan' => 'Professional',
+            ]);
+        $upgradeRes->assertOk();
+
+        // 3. Verify single authoritative store and zero auto-invoices
+        $this->assertSame(0, BillingInvoice::where('company_id', $companyId)->count());
+        $authSub = CompanySubscription::where('company_id', $companyId)->first();
+        $this->assertNotNull($authSub);
+        $this->assertSame($this->proPlan->id, $authSub->plan_id);
+
+        // 4. Verify legacy projection was synchronized and is not stale
+        $legacySubFresh = $legacySub->fresh();
+        $this->assertSame('باقة متقدمة', $legacySubFresh->plan);
+
+        // 5. CRITICAL: Company API must immediately reflect the Platform Admin's modification (not hidden!)
+        $subRes2 = $this->actingAs($adminUser, 'sanctum')->getJson('/api/v1/company/me/subscription');
+        $subRes2->assertOk();
+        $this->assertSame('professional', $subRes2->json('plan.code'));
+
+        // 6. Platform Admin modifies plan via PATCH /api/v1/admin/companies/{id} to Enterprise
+        $patchRes = $this->actingAs($this->platformAdmin, 'sanctum')
+            ->patchJson("/api/v1/admin/companies/{$companyId}", [
+                'plan' => 'Enterprise',
+            ]);
+        $patchRes->assertOk();
+
+        // 7. Verify Company API reflects Enterprise and zero invoices
+        $this->assertSame(0, BillingInvoice::where('company_id', $companyId)->count());
+        $subRes3 = $this->actingAs($adminUser, 'sanctum')->getJson('/api/v1/company/me/subscription');
+        $subRes3->assertOk();
+        $this->assertSame('enterprise', $subRes3->json('plan.code'));
+
+        // Verify legacy projection reflects Enterprise
+        $this->assertSame('باقة مؤسسات', $legacySub->fresh()->plan);
+    }
+
+    public function test_upgrade_fails_closed_with_422_and_rolls_back_when_plan_missing_from_catalog(): void
+    {
+        $createRes = $this->actingAs($this->platformAdmin, 'sanctum')->postJson('/api/v1/admin/companies', [
+            'name' => 'Rollback Upgrade Co',
+            'plan' => 'Basic',
+            'billingCycle' => 'monthly',
+            'contactEmail' => 'owner@rollback-upgrade.test',
+        ]);
+        $createRes->assertCreated();
+        $companyId = $createRes->json('id');
+
+        // Delete Enterprise plan from catalog
+        $this->enterprisePlan->delete();
+
+        // Attempt upgrade to missing Enterprise plan
+        $res = $this->actingAs($this->platformAdmin, 'sanctum')
+            ->postJson("/api/v1/admin/companies/{$companyId}/upgrade", [
+                'plan' => 'Enterprise',
+            ]);
+
+        $res->assertStatus(422);
+        $this->assertSame('VALIDATION_ERROR', $res->json('error.code'));
+        $this->assertArrayHasKey('plan', $res->json('error.details'));
+
+        // Entire transaction must be rolled back: company plan and subscription planId remain Basic
+        $this->assertDatabaseHas('asab_companies', [
+            'id' => $companyId,
+            'plan' => 'Basic',
+        ]);
+        $authSub = CompanySubscription::where('company_id', $companyId)->first();
+        $this->assertSame($this->basicPlan->id, $authSub->plan_id);
+    }
+
+    public function test_patch_company_fails_closed_with_422_and_rolls_back_when_plan_missing_from_catalog(): void
+    {
+        $createRes = $this->actingAs($this->platformAdmin, 'sanctum')->postJson('/api/v1/admin/companies', [
+            'name' => 'Rollback Patch Co',
+            'plan' => 'Basic',
+            'billingCycle' => 'monthly',
+            'contactEmail' => 'owner@rollback-patch.test',
+        ]);
+        $createRes->assertCreated();
+        $companyId = $createRes->json('id');
+
+        // Delete Enterprise plan from catalog
+        $this->enterprisePlan->delete();
+
+        // Attempt PATCH with missing Enterprise plan
+        $res = $this->actingAs($this->platformAdmin, 'sanctum')
+            ->patchJson("/api/v1/admin/companies/{$companyId}", [
+                'plan' => 'Enterprise',
+            ]);
+
+        $res->assertStatus(422);
+        $this->assertSame('VALIDATION_ERROR', $res->json('error.code'));
+        $this->assertArrayHasKey('plan', $res->json('error.details'));
+
+        // Entire transaction must be rolled back
+        $this->assertDatabaseHas('asab_companies', [
+            'id' => $companyId,
+            'plan' => 'Basic',
+        ]);
+        $authSub = CompanySubscription::where('company_id', $companyId)->first();
+        $this->assertSame($this->basicPlan->id, $authSub->plan_id);
+    }
+
+    public function test_annual_subscription_plan_modification_preserves_billing_cycle_and_lifecycle_without_invoices(): void
+    {
+        // 1. Provision annual company with Basic plan
+        $createRes = $this->actingAs($this->platformAdmin, 'sanctum')->postJson('/api/v1/admin/companies', [
+            'name' => 'Annual Lifecycle Gourmet Co',
+            'plan' => 'Basic',
+            'billingCycle' => 'annual',
+            'contactEmail' => 'admin@annual-lifecycle.test',
+            'contactName' => 'Owner Annual Lifecycle',
+        ]);
+        $createRes->assertCreated();
+        $companyId = $createRes->json('id');
+
+        $adminUser = AsabUser::where('email', 'admin@annual-lifecycle.test')->firstOrFail();
+
+        $authSub = CompanySubscription::where('company_id', $companyId)->firstOrFail();
+        $legacySub = AsabSubscription::where('company_id', $companyId)->firstOrFail();
+
+        $originalPeriodEnd = $authSub->current_period_end->toIso8601String();
+        $originalExpiresAt = $legacySub->expires_at->toIso8601String();
+        $originalAutoRenew = $authSub->auto_renew;
+
+        $this->assertSame('annual', $authSub->billing_cycle);
+        $this->assertSame(365, $legacySub->days_left);
+
+        // 2. Platform Admin upgrades to Professional
+        $upgradeRes = $this->actingAs($this->platformAdmin, 'sanctum')
+            ->postJson("/api/v1/admin/companies/{$companyId}/upgrade", [
+                'plan' => 'Professional',
+            ]);
+        $upgradeRes->assertOk();
+
+        // 3. Assert lifecycle fields are strictly preserved
+        $freshAuth = $authSub->fresh();
+        $freshLegacy = $legacySub->fresh();
+
+        $this->assertSame($this->proPlan->id, $freshAuth->plan_id);
+        $this->assertSame('annual', $freshAuth->billing_cycle); // PRESERVED!
+        $this->assertSame($originalPeriodEnd, $freshAuth->current_period_end->toIso8601String()); // PRESERVED!
+        $this->assertSame($originalAutoRenew, $freshAuth->auto_renew); // PRESERVED!
+
+        $this->assertSame('باقة متقدمة', $freshLegacy->plan);
+        $this->assertSame(59900, $freshLegacy->monthly_price);
+        $this->assertSame($originalExpiresAt, $freshLegacy->expires_at->toIso8601String()); // PRESERVED!
+        $this->assertSame(365, $freshLegacy->days_left); // PRESERVED!
+
+        // 4. Zero billing invoices created
+        $this->assertSame(0, BillingInvoice::where('company_id', $companyId)->count());
+
+        // 5. Company API confirms annual cycle and new plan
+        $companyRes = $this->actingAs($adminUser, 'sanctum')->getJson('/api/v1/company/me/subscription');
+        $companyRes->assertOk();
+        $this->assertSame('professional', $companyRes->json('plan.code'));
+        $this->assertSame('annual', $companyRes->json('subscription.billingCycle'));
+        $this->assertSame($originalPeriodEnd, $companyRes->json('subscription.currentPeriodEnd'));
+    }
+
+    public function test_legacy_only_company_fails_closed_without_fabricating_subscription_lifecycle(): void
+    {
+        // Company exists with legacy AsabSubscription ONLY (no CompanySubscription)
+        $company = AsabCompany::create([
+            'name' => 'Legacy Only Annual Co',
+            'plan' => 'Basic',
+            'status' => 'active',
+        ]);
+
+        // Annual subscription nearing end: < 35 days remaining, auto_renew=false, reminder_enabled=true
+        $legacySub = AsabSubscription::create([
+            'company_id' => $company->id,
+            'plan' => 'باقة أساسية',
+            'status' => 'active',
+            'expires_at' => now()->addDays(20),
+            'days_left' => 20,
+            'monthly_price' => 29900,
+            'auto_renew' => false,
+            'reminder_enabled' => true,
+        ]);
+
+        $this->assertSame(0, CompanySubscription::where('company_id', $company->id)->count());
+
+        // Platform Admin attempts to upgrade
+        $res = $this->actingAs($this->platformAdmin, 'sanctum')
+            ->postJson("/api/v1/admin/companies/{$company->id}/upgrade", [
+                'plan' => 'Professional',
+            ]);
+
+        // Must fail closed with 422: cannot modify absent authoritative subscription from incomplete legacy data
+        $res->assertStatus(422);
+        $this->assertSame('VALIDATION_ERROR', $res->json('error.code'));
+        $this->assertArrayHasKey('plan', $res->json('error.details'));
+
+        // Zero mutation: company plan unchanged, no fake CompanySubscription fabricated
+        $this->assertSame('Basic', $company->fresh()->plan);
+        $this->assertSame(0, CompanySubscription::where('company_id', $company->id)->count());
+
+        // Legacy subscription remains completely untouched
+        $freshLegacy = $legacySub->fresh();
+        $this->assertSame('باقة أساسية', $freshLegacy->plan);
+        $this->assertFalse($freshLegacy->auto_renew);
+        $this->assertTrue($freshLegacy->reminder_enabled);
+        $this->assertSame(20, $freshLegacy->days_left);
+    }
+
+    public function test_plan_modification_rejects_inactive_catalog_plan_without_mutation(): void
+    {
+        $createRes = $this->actingAs($this->platformAdmin, 'sanctum')->postJson('/api/v1/admin/companies', [
+            'name' => 'Inactive Plan Test Co',
+            'plan' => 'Basic',
+            'billingCycle' => 'monthly',
+            'contactEmail' => 'admin@inactive-plan.test',
+        ]);
+        $createRes->assertCreated();
+        $companyId = $createRes->json('id');
+
+        // Deactivate Professional plan in catalog
+        $this->proPlan->update(['status' => 'inactive']);
+
+        // Attempt upgrade to inactive plan
+        $res = $this->actingAs($this->platformAdmin, 'sanctum')
+            ->postJson("/api/v1/admin/companies/{$companyId}/upgrade", [
+                'plan' => 'Professional',
+            ]);
+
+        $res->assertStatus(422);
+        $this->assertSame('VALIDATION_ERROR', $res->json('error.code'));
+        $this->assertArrayHasKey('plan', $res->json('error.details'));
+
+        // Zero mutation
+        $this->assertDatabaseHas('asab_companies', [
+            'id' => $companyId,
+            'plan' => 'Basic',
+        ]);
+        $authSub = CompanySubscription::where('company_id', $companyId)->first();
+        $this->assertSame($this->basicPlan->id, $authSub->plan_id);
+    }
 }
