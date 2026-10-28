@@ -2,6 +2,7 @@
 
 namespace Tests\Feature;
 
+use ClosureMySqlLockWaitObserver;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Config;
 use Illuminate\Support\Facades\DB;
@@ -15,6 +16,8 @@ use Modules\Admin\Services\AuthService;
 use Modules\Notification\Services\DeviceTokenService;
 use Symfony\Component\Process\Process;
 use Tests\TestCase;
+
+require_once __DIR__.'/../../scripts/harness/mysql_lock_wait_observer.php';
 
 class AdminSessionRevocationTest extends TestCase
 {
@@ -649,7 +652,7 @@ class AdminSessionRevocationTest extends TestCase
         $this->awaitFile('refresh_first.held');
 
         $logoutWorker = $this->worker('logout_second', 'logout', $user, $access, $refresh, false);
-        $this->awaitLockWait('logout_second');
+        $this->awaitLockWait('logout_second', 'refresh_first');
         $this->release('refresh_first.held_go');
 
         $refreshResult = $this->workerResult($refreshWorker, 'refresh_first');
@@ -669,7 +672,7 @@ class AdminSessionRevocationTest extends TestCase
         $this->awaitFile('logout_first.held');
 
         $refreshWorker = $this->worker('refresh_second', 'refresh', $user, $access, $refresh, false);
-        $this->awaitLockWait('refresh_second');
+        $this->awaitLockWait('refresh_second', 'logout_first');
         $this->release('logout_first.held_go');
 
         $logoutResult = $this->workerResult($logoutWorker, 'logout_first');
@@ -689,7 +692,7 @@ class AdminSessionRevocationTest extends TestCase
         $this->awaitFile('d08_first.held');
 
         $refreshWorker = $this->worker('d08_refresh_second', 'refresh', $user, $access, $refresh, false);
-        $this->awaitLockWait('d08_refresh_second');
+        $this->awaitLockWait('d08_refresh_second', 'd08_first');
         $this->release('d08_first.held_go');
 
         $logoutResult = $this->workerResult($logoutWorker, 'd08_first');
@@ -821,26 +824,44 @@ WORKER;
         file_put_contents($this->barriers.'/'.$suffix, 'go');
     }
 
-    private function awaitLockWait(string $worker): void
+    private function awaitLockWait(string $worker, string $blockingWorker): void
     {
         $this->awaitFile($worker.'.connection');
+        $this->awaitFile($blockingWorker.'.connection');
         $id = (int) file_get_contents($this->barriers.'/'.$worker.'.connection');
+        $blockingId = (int) file_get_contents($this->barriers.'/'.$blockingWorker.'.connection');
+        $serverVersion = (string) DB::selectOne('SELECT VERSION() AS version')->version;
         $deadline = microtime(true) + 10;
         do {
-            $waiting = DB::selectOne(
-                'SELECT trx_query AS query FROM information_schema.INNODB_TRX WHERE trx_mysql_thread_id = ? AND trx_state = ?',
-                [$id, 'LOCK WAIT'],
-            );
-            if ($waiting) {
-                $this->assertStringContainsString('asab_users', $waiting->query);
-                fwrite(STDOUT, "\nS12_LOCK_WAIT ".json_encode(['connection_id' => $id, 'table' => 'asab_users'])."\n");
+            if (stripos($serverVersion, 'mariadb') !== false) {
+                $waiting = DB::selectOne(
+                    'SELECT trx_query AS query FROM information_schema.INNODB_TRX WHERE trx_mysql_thread_id = ? AND trx_state = ?',
+                    [$id, 'LOCK WAIT'],
+                );
+                if ($waiting) {
+                    $this->assertStringContainsString('asab_users', $waiting->query);
+                    fwrite(STDOUT, "\nS12_LOCK_WAIT ".json_encode(['connection_id' => $id, 'table' => 'asab_users', 'monitor' => 'MariaDB INNODB_TRX'])."\n");
 
-                return;
+                    return;
+                }
+            } else {
+                $waiting = ClosureMySqlLockWaitObserver::findWait(
+                    DB::connection()->getPdo(),
+                    $id,
+                    $blockingId,
+                    DB::connection()->getDatabaseName(),
+                    'asab_users',
+                );
+                if ($waiting !== null) {
+                    fwrite(STDOUT, "\nS12_LOCK_WAIT ".json_encode($waiting + ['monitor' => 'Oracle MySQL Performance Schema'])."\n");
+
+                    return;
+                }
             }
             usleep(200000);
         } while (microtime(true) < $deadline);
 
-        $this->fail('Expected an InnoDB user-row lock wait for connection '.$id);
+        $this->fail('Expected an InnoDB user-row lock wait for connection '.$id.' blocked by '.$blockingId);
     }
 
     /** @return array{status: string, connection_id: int, isolation: string, action: string} */

@@ -2,11 +2,14 @@
 
 namespace Tests\Feature;
 
+use ClosureMySqlLockWaitObserver;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
 use Modules\Admin\Models\AsabUser;
 use Symfony\Component\Process\Process;
 use Tests\TestCase;
+
+require_once __DIR__.'/../../scripts/harness/mysql_lock_wait_observer.php';
 
 /** Real processes, independent MySQL/MariaDB connections, committed fixtures, explicit barriers. */
 class AdminLegacyRefreshConcurrencyTest extends TestCase
@@ -88,7 +91,7 @@ class AdminLegacyRefreshConcurrencyTest extends TestCase
             $writer = $this->worker($prefix.'_w', $action, $user, $token->plainTextToken);
             $this->awaitFile($prefix.'_w.held');
             $this->release($prefix.'_r.candidate_go');
-            $this->awaitLockWait($prefix.'_r');
+            $this->awaitLockWait($prefix.'_r', $prefix.'_w');
             $this->release($prefix.'_w.held_go');
             $written = $this->workerResult($writer, $prefix.'_w');
             $rejected = $this->workerResult($refresh, $prefix.'_r');
@@ -113,7 +116,7 @@ class AdminLegacyRefreshConcurrencyTest extends TestCase
             $this->release($prefix.'_r.candidate_go');
             $this->awaitFile($prefix.'_r.held');
             $writer = $this->worker($prefix.'_w', $action, $user, $token->plainTextToken);
-            $this->awaitLockWait($prefix.'_w');
+            $this->awaitLockWait($prefix.'_w', $prefix.'_r');
             $this->release($prefix.'_r.held_go');
             $this->awaitFile($prefix.'_w.held');
             $this->release($prefix.'_w.held_go');
@@ -142,7 +145,7 @@ class AdminLegacyRefreshConcurrencyTest extends TestCase
         $this->release('token_r.candidate_go');
         // Production uses deterministic User -> Token ordering, so the stale
         // refresh must first wait on the user-row lock held by logout.
-        $this->awaitLockWait('token_r', 'asab_users');
+        $this->awaitLockWait('token_r', 'token_w', 'asab_users');
         $this->release('token_w.held_go');
         $written = $this->workerResult($logout, 'token_w');
         $rejected = $this->workerResult($refresh, 'token_r');
@@ -245,23 +248,41 @@ WORKER;
         file_put_contents($this->barriers.'/'.$suffix, 'go');
     }
 
-    private function awaitLockWait(string $worker, string $expectedTable = 'asab_users'): void
+    private function awaitLockWait(string $worker, string $blockingWorker, string $expectedTable = 'asab_users'): void
     {
         $this->awaitFile($worker.'.connection');
+        $this->awaitFile($blockingWorker.'.connection');
         $id = (int) file_get_contents($this->barriers.'/'.$worker.'.connection');
+        $blockingId = (int) file_get_contents($this->barriers.'/'.$blockingWorker.'.connection');
+        $serverVersion = (string) DB::selectOne('SELECT VERSION() AS version')->version;
         $deadline = microtime(true) + 10;
         do {
-            $waiting = DB::selectOne('SELECT trx_query AS query FROM information_schema.INNODB_TRX WHERE trx_mysql_thread_id = ? AND trx_state = ?', [$id, 'LOCK WAIT']);
-            if ($waiting) {
-                $this->assertStringContainsString($expectedTable, $waiting->query);
-                fwrite(STDOUT, "\nS12_LOCK_WAIT ".json_encode(['connection_id' => $id, 'table' => $expectedTable])."\n");
-                $this->assertTrue(true, 'Observed independent connection waiting for row lock');
-                return;
+            if (stripos($serverVersion, 'mariadb') !== false) {
+                $waiting = DB::selectOne('SELECT trx_query AS query FROM information_schema.INNODB_TRX WHERE trx_mysql_thread_id = ? AND trx_state = ?', [$id, 'LOCK WAIT']);
+                if ($waiting) {
+                    $this->assertStringContainsString($expectedTable, $waiting->query);
+                    fwrite(STDOUT, "\nS12_LOCK_WAIT ".json_encode(['connection_id' => $id, 'table' => $expectedTable, 'monitor' => 'MariaDB INNODB_TRX'])."\n");
+                    $this->assertTrue(true, 'Observed independent connection waiting for row lock');
+                    return;
+                }
+            } else {
+                $waiting = ClosureMySqlLockWaitObserver::findWait(
+                    DB::connection()->getPdo(),
+                    $id,
+                    $blockingId,
+                    DB::connection()->getDatabaseName(),
+                    $expectedTable,
+                );
+                if ($waiting !== null) {
+                    fwrite(STDOUT, "\nS12_LOCK_WAIT ".json_encode($waiting + ['monitor' => 'Oracle MySQL Performance Schema'])."\n");
+                    $this->assertTrue(true, 'Observed independent connection waiting for row lock');
+                    return;
+                }
             }
             // InnoDB metadata is cached; allow more than 100ms between reads.
             usleep(200000);
         } while (microtime(true) < $deadline);
-        $this->fail('Expected an actual InnoDB lock wait for '.$worker.' connection '.$id);
+        $this->fail('Expected an actual InnoDB lock wait for '.$worker.' connection '.$id.' blocked by '.$blockingId);
     }
 
     private function workerResult(Process $worker, string $name): array
@@ -278,7 +299,7 @@ WORKER;
             'engines' => DB::select("SELECT TABLE_NAME, ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN ('asab_users', 'personal_access_tokens', 'admin_sessions')"),
             'token_count' => $this->users[count($this->users) - 1]->tokens()->count(),
             'observer_connection' => (int) DB::selectOne('SELECT CONNECTION_ID() AS id')->id,
-            'barrier' => $scenario === 'refresh/refresh' ? 'both candidates resolved before release' : 'candidate-resolved + user/token-held; observed INNODB_TRX LOCK WAIT'];
+            'barrier' => $scenario === 'refresh/refresh' ? 'both candidates resolved before release' : 'candidate-resolved + user/token-held; observed engine lock wait'];
         fwrite(STDOUT, "\nS12_CONCURRENCY ".json_encode($record)."\n");
     }
 }

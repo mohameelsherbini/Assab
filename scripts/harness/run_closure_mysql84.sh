@@ -68,7 +68,10 @@ $user = getenv("DB_USERNAME");
 $password = getenv("DB_PASSWORD");
 if (!preg_match("/\\Aassab_ci_[0-9]+_[0-9]+\\z/", $user) || !preg_match("/\\A[0-9a-f]{48}\\z/", $password)) { throw new RuntimeException("Invalid ephemeral test account identity"); }
 $pdo = new PDO("mysql:host=".getenv("DB_HOST").";port=".getenv("DB_PORT"), getenv("MYSQL_ROOT_USERNAME"), getenv("MYSQL_ROOT_PASSWORD"), [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
-$pdo->exec("CREATE USER ".$pdo->quote($user)."@\x27%\x27 IDENTIFIED BY ".$pdo->quote($password));
+$principal = $pdo->quote($user)."@\x27%\x27";
+$pdo->exec("CREATE USER ".$principal." IDENTIFIED BY ".$pdo->quote($password));
+$pdo->exec("GRANT SELECT ON performance_schema.data_locks TO ".$principal);
+$pdo->exec("GRANT SELECT ON performance_schema.data_lock_waits TO ".$principal);
 ' || fail 'Could not create the run-scoped, least-privilege test account.'
 
 # Create only run-scoped schemas and grant a random test account access only to
@@ -78,13 +81,14 @@ create_schema() {
   case "$database" in
     "s111_phase234_audit_${run_key}"|"s111_phase567_test_${run_key}"|"s111_phase8910_test_${run_key}"|\
     "pkg7_test_${run_key}"|"pkg6_disposable_${run_key}"|"s12_at02_${run_key}"|"s12_fs12_${run_key}"|\
+    "assab_lock_probe_${run_key}"|\
     "pkg67_mysql_disposable_composition_${run_key}"|"pkg67_mysql_disposable_b01_${run_key}") ;;
     *) echo "Refusing schema outside this run's allowlist: $database" >&2; return 1 ;;
   esac
 
   DB_DATABASE="$database" php -r '
 $db = getenv("DB_DATABASE");
-$allowed = "/\\A(?:(?:s111_phase234_audit|s111_phase567_test|s111_phase8910_test|pkg7_test|pkg6_disposable|s12_at02|s12_fs12)_[0-9]+_[0-9]+|pkg67_mysql_disposable_(?:composition|b01)_[0-9]+_[0-9]+)\\z/";
+$allowed = "/\\A(?:(?:s111_phase234_audit|s111_phase567_test|s111_phase8910_test|pkg7_test|pkg6_disposable|s12_at02|s12_fs12|assab_lock_probe)_[0-9]+_[0-9]+|pkg67_mysql_disposable_(?:composition|b01)_[0-9]+_[0-9]+)\\z/";
 if (!preg_match($allowed, $db)) { throw new RuntimeException("Rejected disposable schema name"); }
 $pdo = new PDO("mysql:host=".getenv("DB_HOST").";port=".getenv("DB_PORT"), getenv("MYSQL_ROOT_USERNAME"), getenv("MYSQL_ROOT_PASSWORD"), [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
 $exists = $pdo->prepare("SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = ?");
@@ -102,6 +106,19 @@ record_exit() {
 }
 
 overall=0
+
+# Prove least-privilege Performance Schema access and a real two-connection row
+# lock wait before any long migration or concurrency group starts.
+lock_probe_schema="assab_lock_probe_${run_key}"
+create_schema "$lock_probe_schema" || fail 'Could not create the disposable lock-observation probe schema.'
+set +e
+DB_DATABASE="$lock_probe_schema" php scripts/harness/assert_mysql84_lock_observation.php 2>&1 \
+  | tee "$artifact_dir/lock-observation-preflight.log"
+lock_probe_rc=${PIPESTATUS[0]}
+set -u
+record_exit lock-observation.preflight "$lock_probe_rc"
+[[ "$lock_probe_rc" -eq 0 ]] || fail 'Performance Schema lock-observation preflight failed; concurrency suites were not started.'
+echo 'CLOSURE_LOCK_OBSERVATION_PRECHECK=PASS' | tee -a "$artifact_dir/run-status.txt"
 
 run_legacy_suite() {
   local label="$1" database="$2" expected_count="$3" test_file="$4"
