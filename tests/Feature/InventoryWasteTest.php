@@ -280,6 +280,29 @@ class InventoryWasteTest extends TestCase
         $this->assertSame(1, EmployeeMovement::where('category', 'inventory_variance')->count());
     }
 
+    public function test_invalid_daily_variance_replacement_preserves_existing_ledger_rows(): void
+    {
+        $this->inventoryOp([['itemId' => 'sku-1', 'name' => 'أرز', 'expectedQty' => 10, 'actualQty' => 8, 'unitPriceHalalas' => 1000]]);
+        $date = now()->toDateString();
+        $url = "/api/v1/accountant/inventory/branches/{$this->branchA->id}/daily-variance-allocation";
+
+        $this->acc()->postJson($url, [
+            'date' => $date,
+            'items' => [['itemId' => 'sku-1', 'allocations' => [['employeeId' => $this->emp1->id, 'qty' => 2]]]],
+        ])->assertOk();
+
+        $originalMovementId = EmployeeMovement::where('category', 'inventory_variance')->sole()->id;
+        $originalPayload = Operation::where('module_key', 'inventory')->sole()->payload;
+
+        $this->acc()->postJson($url, [
+            'date' => $date,
+            'items' => [['itemId' => 'sku-1', 'allocations' => [['employeeId' => 'not-in-this-branch', 'qty' => 2]]]],
+        ])->assertStatus(422);
+
+        $this->assertSame($originalMovementId, EmployeeMovement::where('category', 'inventory_variance')->sole()->id);
+        $this->assertSame($originalPayload, Operation::where('module_key', 'inventory')->sole()->payload);
+    }
+
     public function test_daily_variance_allocation_without_op_is_404(): void
     {
         $this->acc()->postJson("/api/v1/accountant/inventory/branches/{$this->branchA->id}/daily-variance-allocation", [
