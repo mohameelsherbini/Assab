@@ -1,0 +1,143 @@
+name: ASSAB FUND-04 & PKG-67 Oracle MySQL 8.4 Concurrency CI
+
+on:
+  push:
+    branches:
+      - 'experiment/wave12-fund04-pkg67-mysql84-ci'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: assab-wave12-concurrency-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  APP_ENV: testing
+  APP_DEBUG: 'false'
+  APP_KEY: base64:MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=
+  APP_URL: http://127.0.0.1
+  CACHE_STORE: array
+  MAIL_MAILER: array
+  QUEUE_CONNECTION: sync
+  SESSION_DRIVER: array
+  COMPOSER_NO_INTERACTION: '1'
+  MYSQL_TEST_HOST: 127.0.0.1
+  MYSQL_TEST_PORT: '3306'
+  MYSQL_TEST_USER: assab_proof_user
+
+jobs:
+  wave12-mysql-concurrency:
+    name: FUND-04 & PKG-67 Concurrency Proof (Oracle MySQL 8.4 / PHP 8.3)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ALLOW_EMPTY_PASSWORD: 'yes'
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Prepare artifact directory
+        run: mkdir -p artifacts storage/logs
+
+      - name: Record SHA provenance & Verify Base Integrity
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Target Branch: ${{ github.ref }}" | tee artifacts/provenance.txt
+          echo "Candidate Commit SHA: $(git rev-parse HEAD)" | tee -a artifacts/provenance.txt
+          echo "Parent Base SHA: $(git rev-parse HEAD~1)" | tee -a artifacts/provenance.txt
+          
+          EXPECTED_BASE="dabb172236f89f806e95273d2f0ce33abeec6c91"
+          ACTUAL_PARENT="$(git rev-parse HEAD~1)"
+          if [[ "${ACTUAL_PARENT}" != "${EXPECTED_BASE}" ]]; then
+            echo "::error title=BASE SHA MISMATCH::Parent commit must be ${EXPECTED_BASE}, got ${ACTUAL_PARENT}" >&2
+            exit 1
+          fi
+          echo "Base commit verified: Exactly matches ${EXPECTED_BASE}"
+
+      - name: Fail-closed physical environment isolation guard
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_ACTIONS:-false}" != "true" || "${RUNNER_ENVIRONMENT:-}" != "github-hosted" ]]; then
+            echo "::error title=ENVIRONMENT BARRIER::Concurrency proof must strictly execute inside ephemeral GitHub-hosted runners!" >&2
+            exit 1
+          fi
+          if env | grep -Eiq 'coolify|staging|production|hostinger|railway|live|prod_db'; then
+            echo "::error title=SAFETY GUARD BLOCKED::Forbidden staging or production environment variable detected in runner!" >&2
+            exit 1
+          fi
+          echo "Physical environment isolation verified: GitHub-hosted ephemeral runner with zero external credentials." | tee artifacts/isolation.txt
+
+      - name: Setup PHP 8.3
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: bcmath, curl, dom, fileinfo, gd, intl, mbstring, pdo_mysql, pdo_sqlite, tokenizer, xml, zip
+          coverage: none
+          tools: composer:v2
+
+      - name: Install locked Composer dependencies
+        run: composer install --no-interaction --prefer-dist --no-progress
+
+      - name: Generate Ephemeral Credentials & Enforce Least-Privilege Role
+        shell: bash
+        run: |
+          set -euo pipefail
+          EPHEMERAL_ROOT_PW=$(openssl rand -hex 24)
+          EPHEMERAL_TEST_PW=$(openssl rand -hex 24)
+
+          echo "::add-mask::${EPHEMERAL_ROOT_PW}"
+          echo "::add-mask::${EPHEMERAL_TEST_PW}"
+
+          mysql -h 127.0.0.1 -P 3306 -u root \
+            -e "ALTER USER 'root'@'%' IDENTIFIED BY '${EPHEMERAL_ROOT_PW}';"
+
+          MYSQL_PWD="${EPHEMERAL_ROOT_PW}" mysql -h 127.0.0.1 -P 3306 -u root <<SQL
+          CREATE USER IF NOT EXISTS 'assab_proof_user'@'%' IDENTIFIED BY '${EPHEMERAL_TEST_PW}';
+          ALTER USER 'assab_proof_user'@'%' IDENTIFIED BY '${EPHEMERAL_TEST_PW}';
+          REVOKE ALL PRIVILEGES, GRANT OPTION FROM 'assab_proof_user'@'%';
+          GRANT CREATE, DROP, ALTER, SELECT, INSERT, UPDATE, DELETE, INDEX, REFERENCES, LOCK TABLES, CREATE VIEW, SHOW VIEW, CREATE ROUTINE, ALTER ROUTINE, EXECUTE
+            ON \`assab\_proof\_%\`.* TO 'assab_proof_user'@'%';
+          FLUSH PRIVILEGES;
+          SQL
+
+          echo "MYSQL_ROOT_PASSWORD=${EPHEMERAL_ROOT_PW}" >> "$GITHUB_ENV"
+          echo "MYSQL_TEST_PASSWORD=${EPHEMERAL_TEST_PW}" >> "$GITHUB_ENV"
+
+      - name: Clear cached configuration
+        run: |
+          php artisan config:clear
+          php artisan cache:clear
+
+      - name: Execute FUND-04 & PKG-67 Concurrency Proof Harness
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x scripts/ci/run_mysql_fund04_pkg67_proof.sh
+          ./scripts/ci/run_mysql_fund04_pkg67_proof.sh
+
+      - name: Upload Proof Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wave12-mysql84-concurrency-evidence
+          path: |
+            artifacts/
+            storage/logs/
+          retention-days: 14
+          if-no-files-found: error
